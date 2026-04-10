@@ -1,0 +1,11 @@
+{
+  "name": "jump-video-analysis",
+  "version": "1.0.0",
+  "description": "Local Expo module for recorded jump video landmark extraction.",
+  "main": "index.ts",
+  "license": "UNLICENSED",
+  "peerDependencies": {
+    "expo": "*",
+    "expo-modules-core": "*"
+  }
+}

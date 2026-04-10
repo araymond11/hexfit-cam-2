@@ -1,15 +1,21 @@
 {
   "expo": {
-    "name": "my-app",
-    "slug": "my-app",
+    "name": "hexfit-cam",
+    "slug": "hexfit-cam",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "myapp",
+    "scheme": "hexfitcam",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "googleServicesFile": "./GoogleService-Info.plist",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Hexfit needs camera access to measure your jump height using pose estimation.",
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "bundleIdentifier": "com.aray11.hexfitcam"
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +25,10 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
     },
     "web": {
       "output": "static",
@@ -27,6 +36,22 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "static",
+            "buildReactNativeFromSource": true
+          }
+        }
+      ],
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Hexfit needs camera access to measure your jump height using pose estimation.",
+          "enableMicrophonePermission": false
+        }
+      ],
       [
         "expo-splash-screen",
         {
@@ -38,11 +63,18 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-video"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "1b2ebc75-0fdd-4494-b406-8e483df16bbb"
+      }
     }
   }
 }

@@ -1,0 +1,7 @@
+{
+  "platforms": ["apple"],
+  "apple": {
+    "modules": ["JumpVideoAnalysisModule"],
+    "podspecPath": "ios/JumpVideoAnalysis.podspec"
+  }
+}
