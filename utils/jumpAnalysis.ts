@@ -1113,59 +1113,107 @@ function evaluateAttemptCandidate(
     }
   }
 
-  // --- Sub-frame interpolation: refine landing timestamp ---
-  // The landing detection fires at the first frame crossing the contact threshold
-  // (lift ≤ 0.012), but the visual/physical landing corresponds to when the foot
-  // crosses the clear threshold (0.028) on its way down. Interpolate between the
-  // last clearly-airborne frame and the first frame entering the dead zone to find
-  // the precise crossing time.
+  // --- Adaptive symmetric refinement for takeoff & landing timestamps ---
+  // The fixed contact/clear thresholds create a wide dead zone (~34ms at 240fps).
+  // Instead, use an adaptive threshold based on the peak foot clearance during
+  // flight. The SAME threshold is used for both events so the foot is at the same
+  // height at takeoff and landing — systematic errors cancel out.
   if (takeoffMs !== null && landingMs !== null) {
-    const captureTimeByFrame = new Map<number, number>();
-    for (const sig of evaluationSignals) {
-      captureTimeByFrame.set(sig.frameIndex, sig.captureTimestampMs);
+    // 1. Compute peak min-foot-lift during the flight phase.
+    let peakMinLift = 0;
+    for (const sample of phaseTimeline) {
+      if (sample.timestampMs < takeoffMs || sample.timestampMs > landingMs) continue;
+      const minLift = Math.min(
+        sample.leftLift ?? -Infinity,
+        sample.rightLift ?? -Infinity,
+      );
+      if (Number.isFinite(minLift) && minLift > peakMinLift) {
+        peakMinLift = minLift;
+      }
     }
 
-    for (let i = 1; i < phaseTimeline.length; i++) {
-      const prev = phaseTimeline[i - 1];
-      const curr = phaseTimeline[i];
+    // 2. Adaptive threshold: 40% of peak, clamped to [0.035, 0.080].
+    const refineThreshold = Math.max(0.035, Math.min(peakMinLift * 0.40, 0.080));
 
-      // Only look in the airborne→landing transition zone
-      if (curr.timestampMs <= takeoffMs) continue;
-      if (prev.timestampMs > landingMs + 20) break;
+    // Only refine if the peak clearance is well above the threshold (real jump).
+    if (peakMinLift > refineThreshold * 1.5) {
+      const captureTimeByFrame = new Map<number, number>();
+      for (const sig of evaluationSignals) {
+        captureTimeByFrame.set(sig.frameIndex, sig.captureTimestampMs);
+      }
 
-      const prevMinLift = Math.min(
-        prev.leftLift ?? Infinity,
-        prev.rightLift ?? Infinity,
-      );
-      const currMinLift = Math.min(
-        curr.leftLift ?? Infinity,
-        curr.rightLift ?? Infinity,
-      );
+      const origTakeoffMs = takeoffMs;
+      const origTakeoffCaptureMs = takeoffCaptureMs;
+      const origLandingMs = landingMs;
+      const origLandingCaptureMs = landingCaptureMs;
 
-      // Find downward crossing of TOE_CLEAR_THRESHOLD (foot entering dead zone)
-      if (
-        Number.isFinite(prevMinLift) &&
-        Number.isFinite(currMinLift) &&
-        prevMinLift > TOE_CLEAR_THRESHOLD &&
-        currMinLift <= TOE_CLEAR_THRESHOLD
-      ) {
-        const range = prevMinLift - currMinLift;
-        if (range > 0) {
-          const ratio = (prevMinLift - TOE_CLEAR_THRESHOLD) / range;
-          const refinedLandingMs = prev.timestampMs + ratio * (curr.timestampMs - prev.timestampMs);
+      // 3. Refine takeoff: find UPWARD crossing of refineThreshold.
+      //    Search from before lastContactMs to well after takeoffCandidateStart.
+      for (let i = 1; i < phaseTimeline.length; i++) {
+        const prev = phaseTimeline[i - 1];
+        const curr = phaseTimeline[i];
+        if (curr.timestampMs < (lastContactMs ?? takeoffMs) - 20) continue;
+        if (prev.timestampMs > takeoffMs + 100) break;
 
-          // Only accept if refined time is earlier than original (closer to visual landing)
-          if (refinedLandingMs < landingMs) {
-            landingMs = refinedLandingMs;
+        const prevMinLift = Math.min(prev.leftLift ?? Infinity, prev.rightLift ?? Infinity);
+        const currMinLift = Math.min(curr.leftLift ?? Infinity, curr.rightLift ?? Infinity);
 
-            const prevCapture = captureTimeByFrame.get(prev.frameIndex);
-            const currCapture = captureTimeByFrame.get(curr.frameIndex);
-            if (prevCapture !== undefined && currCapture !== undefined) {
-              landingCaptureMs = prevCapture + ratio * (currCapture - prevCapture);
+        if (
+          Number.isFinite(prevMinLift) && Number.isFinite(currMinLift) &&
+          prevMinLift < refineThreshold && currMinLift >= refineThreshold
+        ) {
+          const range = currMinLift - prevMinLift;
+          if (range > 0) {
+            const ratio = (refineThreshold - prevMinLift) / range;
+            takeoffMs = prev.timestampMs + ratio * (curr.timestampMs - prev.timestampMs);
+            const pc = captureTimeByFrame.get(prev.frameIndex);
+            const cc = captureTimeByFrame.get(curr.frameIndex);
+            if (pc !== undefined && cc !== undefined) {
+              takeoffCaptureMs = pc + ratio * (cc - pc);
             }
           }
+          break;
         }
-        break;
+      }
+
+      // 4. Refine landing: find DOWNWARD crossing of refineThreshold.
+      //    Search near the detected landing, working forward from mid-flight.
+      let landingRefined = false;
+      for (let i = phaseTimeline.length - 1; i >= 1; i--) {
+        const prev = phaseTimeline[i - 1];
+        const curr = phaseTimeline[i];
+        if (curr.timestampMs < origLandingMs - 100) break;
+        if (prev.timestampMs > origLandingMs + 20) continue;
+
+        const prevMinLift = Math.min(prev.leftLift ?? Infinity, prev.rightLift ?? Infinity);
+        const currMinLift = Math.min(curr.leftLift ?? Infinity, curr.rightLift ?? Infinity);
+
+        if (
+          Number.isFinite(prevMinLift) && Number.isFinite(currMinLift) &&
+          prevMinLift >= refineThreshold && currMinLift < refineThreshold
+        ) {
+          const range = prevMinLift - currMinLift;
+          if (range > 0) {
+            const ratio = (prevMinLift - refineThreshold) / range;
+            landingMs = prev.timestampMs + ratio * (curr.timestampMs - prev.timestampMs);
+            const pc = captureTimeByFrame.get(prev.frameIndex);
+            const cc = captureTimeByFrame.get(curr.frameIndex);
+            if (pc !== undefined && cc !== undefined) {
+              landingCaptureMs = pc + ratio * (cc - pc);
+            }
+          }
+          landingRefined = true;
+          break;
+        }
+      }
+
+      // 5. Safety: if refined flight time is out of range, revert to originals.
+      const refinedFlight = (landingCaptureMs ?? landingMs)! - (takeoffCaptureMs ?? takeoffMs)!;
+      if (refinedFlight < MIN_FLIGHT_MS || refinedFlight > MAX_FLIGHT_MS) {
+        takeoffMs = origTakeoffMs;
+        takeoffCaptureMs = origTakeoffCaptureMs;
+        landingMs = origLandingMs;
+        landingCaptureMs = origLandingCaptureMs;
       }
     }
   }
