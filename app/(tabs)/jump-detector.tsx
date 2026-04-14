@@ -410,10 +410,13 @@ function ReviewPlayer({
   const [timelineWidth, setTimelineWidth] = useState(0);
   const [shellSize, setShellSize] = useState({ width: 0, height: 0 });
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const isRecordedSlowMo = !clip.assetId && clip.fps >= 120;
+  const slowMoRate = isRecordedSlowMo ? 30 / clip.fps : 1.0;
   const player = useVideoPlayer(clip.uri, (instance) => {
     instance.loop = false;
     instance.muted = true;
     instance.timeUpdateEventInterval = 1 / 30;
+    instance.playbackRate = slowMoRate;
   });
   const { currentTime } = useEvent(player, 'timeUpdate', {
     currentTime: 0,
