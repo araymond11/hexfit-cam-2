@@ -1039,8 +1039,8 @@ function evaluateAttemptCandidate(
         takeoffCandidateStartCaptureMs ??= signal.captureTimestampMs;
         takeoffConfirm += 1;
         if (takeoffConfirm >= requiredTakeoffConfirmFrames(sampleFps, leftContact, rightContact)) {
-          takeoffMs = lastContactMs ?? takeoffCandidateStart;
-          takeoffCaptureMs = lastContactCaptureMs ?? takeoffCandidateStartCaptureMs;
+          takeoffMs = takeoffCandidateStart;
+          takeoffCaptureMs = takeoffCandidateStartCaptureMs;
           airborne = true;
           stablePostLandingFrames = 0;
         }
@@ -1110,6 +1110,63 @@ function evaluateAttemptCandidate(
 
     if (landingMs !== null && stablePostLandingFrames >= LANDING_CONFIRM_FRAMES + 2) {
       break;
+    }
+  }
+
+  // --- Sub-frame interpolation: refine landing timestamp ---
+  // The landing detection fires at the first frame crossing the contact threshold
+  // (lift ≤ 0.012), but the visual/physical landing corresponds to when the foot
+  // crosses the clear threshold (0.028) on its way down. Interpolate between the
+  // last clearly-airborne frame and the first frame entering the dead zone to find
+  // the precise crossing time.
+  if (takeoffMs !== null && landingMs !== null) {
+    const captureTimeByFrame = new Map<number, number>();
+    for (const sig of evaluationSignals) {
+      captureTimeByFrame.set(sig.frameIndex, sig.captureTimestampMs);
+    }
+
+    for (let i = 1; i < phaseTimeline.length; i++) {
+      const prev = phaseTimeline[i - 1];
+      const curr = phaseTimeline[i];
+
+      // Only look in the airborne→landing transition zone
+      if (curr.timestampMs <= takeoffMs) continue;
+      if (prev.timestampMs > landingMs + 20) break;
+
+      const prevMinLift = Math.min(
+        prev.leftLift ?? Infinity,
+        prev.rightLift ?? Infinity,
+      );
+      const currMinLift = Math.min(
+        curr.leftLift ?? Infinity,
+        curr.rightLift ?? Infinity,
+      );
+
+      // Find downward crossing of TOE_CLEAR_THRESHOLD (foot entering dead zone)
+      if (
+        Number.isFinite(prevMinLift) &&
+        Number.isFinite(currMinLift) &&
+        prevMinLift > TOE_CLEAR_THRESHOLD &&
+        currMinLift <= TOE_CLEAR_THRESHOLD
+      ) {
+        const range = prevMinLift - currMinLift;
+        if (range > 0) {
+          const ratio = (prevMinLift - TOE_CLEAR_THRESHOLD) / range;
+          const refinedLandingMs = prev.timestampMs + ratio * (curr.timestampMs - prev.timestampMs);
+
+          // Only accept if refined time is earlier than original (closer to visual landing)
+          if (refinedLandingMs < landingMs) {
+            landingMs = refinedLandingMs;
+
+            const prevCapture = captureTimeByFrame.get(prev.frameIndex);
+            const currCapture = captureTimeByFrame.get(curr.frameIndex);
+            if (prevCapture !== undefined && currCapture !== undefined) {
+              landingCaptureMs = prevCapture + ratio * (currCapture - prevCapture);
+            }
+          }
+        }
+        break;
+      }
     }
   }
 
@@ -1508,7 +1565,7 @@ export function analyzeJumpLandmarks(
     physicalLandingMs,
     flightMs,
     heightCm,
-    `Detected last toe contact at ${attempt.takeoffMs?.toFixed(1)} ms playback and first return-to-ground contact at ${attempt.landingMs?.toFixed(1)} ms playback.`,
+    `Detected takeoff at ${attempt.takeoffMs?.toFixed(1)} ms playback and landing at ${attempt.landingMs?.toFixed(1)} ms playback.`,
   );
 }
 
