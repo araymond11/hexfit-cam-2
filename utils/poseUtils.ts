@@ -1,30 +1,53 @@
 import type { Keypoint } from '@tensorflow-models/pose-detection';
 
-/** MoveNet 17-keypoint indices */
+/** ML Kit / MediaPipe BlazePose 33-keypoint indices */
 export const KP = {
   NOSE: 0,
-  LEFT_EYE: 1,
-  RIGHT_EYE: 2,
-  LEFT_EAR: 3,
-  RIGHT_EAR: 4,
-  LEFT_SHOULDER: 5,
-  RIGHT_SHOULDER: 6,
-  LEFT_ELBOW: 7,
-  RIGHT_ELBOW: 8,
-  LEFT_WRIST: 9,
-  RIGHT_WRIST: 10,
-  LEFT_HIP: 11,
-  RIGHT_HIP: 12,
-  LEFT_KNEE: 13,
-  RIGHT_KNEE: 14,
-  LEFT_ANKLE: 15,
-  RIGHT_ANKLE: 16,
+  LEFT_EYE_INNER: 1,
+  LEFT_EYE: 2,
+  LEFT_EYE_OUTER: 3,
+  RIGHT_EYE_INNER: 4,
+  RIGHT_EYE: 5,
+  RIGHT_EYE_OUTER: 6,
+  LEFT_EAR: 7,
+  RIGHT_EAR: 8,
+  LEFT_MOUTH: 9,
+  RIGHT_MOUTH: 10,
+  LEFT_SHOULDER: 11,
+  RIGHT_SHOULDER: 12,
+  LEFT_ELBOW: 13,
+  RIGHT_ELBOW: 14,
+  LEFT_WRIST: 15,
+  RIGHT_WRIST: 16,
+  LEFT_PINKY: 17,
+  RIGHT_PINKY: 18,
+  LEFT_INDEX_FINGER: 19,
+  RIGHT_INDEX_FINGER: 20,
+  LEFT_THUMB: 21,
+  RIGHT_THUMB: 22,
+  LEFT_HIP: 23,
+  RIGHT_HIP: 24,
+  LEFT_KNEE: 25,
+  RIGHT_KNEE: 26,
+  LEFT_ANKLE: 27,
+  RIGHT_ANKLE: 28,
+  LEFT_HEEL: 29,
+  RIGHT_HEEL: 30,
+  LEFT_FOOT_INDEX: 31,
+  RIGHT_FOOT_INDEX: 32,
 } as const;
 
 /** Pairs of keypoint indices defining skeleton line segments */
 export const SKELETON_CONNECTIONS: [number, number][] = [
-  [KP.NOSE, KP.LEFT_SHOULDER],
-  [KP.NOSE, KP.RIGHT_SHOULDER],
+  [KP.NOSE, KP.LEFT_EYE_INNER],
+  [KP.LEFT_EYE_INNER, KP.LEFT_EYE],
+  [KP.LEFT_EYE, KP.LEFT_EYE_OUTER],
+  [KP.LEFT_EYE_OUTER, KP.LEFT_EAR],
+  [KP.NOSE, KP.RIGHT_EYE_INNER],
+  [KP.RIGHT_EYE_INNER, KP.RIGHT_EYE],
+  [KP.RIGHT_EYE, KP.RIGHT_EYE_OUTER],
+  [KP.RIGHT_EYE_OUTER, KP.RIGHT_EAR],
+  [KP.LEFT_MOUTH, KP.RIGHT_MOUTH],
   [KP.LEFT_SHOULDER, KP.RIGHT_SHOULDER],
   [KP.LEFT_SHOULDER, KP.LEFT_ELBOW],
   [KP.LEFT_ELBOW, KP.LEFT_WRIST],
@@ -37,6 +60,12 @@ export const SKELETON_CONNECTIONS: [number, number][] = [
   [KP.LEFT_KNEE, KP.LEFT_ANKLE],
   [KP.RIGHT_HIP, KP.RIGHT_KNEE],
   [KP.RIGHT_KNEE, KP.RIGHT_ANKLE],
+  [KP.LEFT_ANKLE, KP.LEFT_HEEL],
+  [KP.LEFT_HEEL, KP.LEFT_FOOT_INDEX],
+  [KP.LEFT_ANKLE, KP.LEFT_FOOT_INDEX],
+  [KP.RIGHT_ANKLE, KP.RIGHT_HEEL],
+  [KP.RIGHT_HEEL, KP.RIGHT_FOOT_INDEX],
+  [KP.RIGHT_ANKLE, KP.RIGHT_FOOT_INDEX],
 ];
 
 export const MIN_CONFIDENCE = 0.3;
@@ -68,6 +97,21 @@ export function getAnkleMidpointY(
   if (laOk && raOk) return (la.y + ra.y) / 2;
   if (laOk) return la.y;
   if (raOk) return ra.y;
+  return null;
+}
+
+/** Returns the best available foot-index (toe) Y. */
+export function getFootIndexY(
+  kps: Keypoint[],
+  minConfidence: number = MIN_CONFIDENCE,
+): number | null {
+  const lt = kps[KP.LEFT_FOOT_INDEX];
+  const rt = kps[KP.RIGHT_FOOT_INDEX];
+  const ltOk = lt && (lt.score ?? 0) >= minConfidence;
+  const rtOk = rt && (rt.score ?? 0) >= minConfidence;
+  if (ltOk && rtOk) return (lt.y + rt.y) / 2;
+  if (ltOk) return lt.y;
+  if (rtOk) return rt.y;
   return null;
 }
 

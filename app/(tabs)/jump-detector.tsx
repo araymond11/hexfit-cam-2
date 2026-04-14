@@ -1,9 +1,11 @@
 import { useIsFocused } from '@react-navigation/native';
 import { useEvent } from 'expo';
+import * as ImagePicker from 'expo-image-picker';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   LayoutChangeEvent,
   Platform,
   Pressable,
@@ -29,13 +31,18 @@ import {
   analyzeRecordedJumpVideo,
   isJumpVideoAnalysisAvailable,
 } from '@/modules/jump-video-analysis';
-import { analyzeJumpLandmarks, explainJumpAnalysis, findFrameAtTime } from '@/utils/jumpAnalysis';
-import type {
-  JumpAnalysisResult,
-  JumpClip,
-  JumpContactPhase,
-  JumpPhaseSample,
-  JumpVideoNativeResult,
+import {
+  analyzeJumpLandmarks,
+  explainJumpAnalysis,
+  findFrameAtTime,
+} from '@/utils/jumpAnalysis';
+import {
+  heightFromFlightTime,
+  type JumpClip,
+  type JumpAnalysisResult,
+  type JumpLandmarkFrame,
+  type JumpPhaseSample,
+  type JumpVideoNativeResult,
 } from '@/utils/jumpCalc';
 
 type JumpStage =
@@ -56,11 +63,21 @@ const Spacing = {
 const COUNTDOWN_SEQUENCE = ['Hold still', '3', '2', '1'] as const;
 const HOLD_STILL_MS = 1000;
 const RECORDING_HARD_CAP_MS = 4000;
+const MIN_ANALYSIS_WINDOW_MS = 1600;
+const MAX_STANDARD_ANALYSIS_WINDOW_MS = 12000;
+const MAX_SLOW_MO_PLAYBACK_WINDOW_MS = 30000;
+
+interface ManualJumpEventSelection {
+  frameIndex: number;
+  playbackMs: number;
+  physicalMs: number;
+}
 
 const SETUP_COPY = [
-  'Place the camera in a side view.',
-  'Keep the full body, both feet, and the floor visible.',
-  'Stand still through the countdown, then jump once.',
+  'Import an iPhone 240 fps slow-motion video when possible.',
+  'Keep the full body and face visible from head to feet for the whole jump.',
+  'Use a fixed camera. One athlete only. Stay still briefly before takeoff.',
+  'Front or slight 3/4 view is acceptable as long as both feet stay visible.',
 ];
 
 function normalizedResolution(format: CameraDeviceFormat): { longSide: number; shortSide: number } {
@@ -120,8 +137,12 @@ function selectFpsFirstFormat(device: CameraDevice | undefined): CameraDeviceFor
   return [...formats].sort((a, b) => b.maxFps - a.maxFps)[0];
 }
 
-function normalizeFileUri(path: string): string {
-  return path.startsWith('file://') ? path : `file://${path}`;
+function normalizeMediaUri(input: string): string {
+  if (!input) return input;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(input)) {
+    return input;
+  }
+  return input.startsWith('/') ? `file://${input}` : input;
 }
 
 function formatMs(value: number | null): string {
@@ -129,7 +150,54 @@ function formatMs(value: number | null): string {
   return `${value.toFixed(1)} ms`;
 }
 
-function phaseColor(phase: JumpContactPhase | null): string {
+function formatDetailedTime(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  const roundedMs = Math.abs(value - Math.round(value)) < 0.05 ? `${Math.round(value)}` : value.toFixed(1);
+  return `${roundedMs}ms (${(value / 1000).toFixed(3)}s)`;
+}
+
+function formatFramePrecision(fps: number | null | undefined): string {
+  if (!fps || !Number.isFinite(fps) || fps <= 0) return '—';
+  return `±${(1000 / fps).toFixed(2)} ms`;
+}
+
+function formatSignedNumber(value: number | null, digits = 1): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}`;
+}
+
+function formatSignedMilliseconds(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${formatSignedNumber(value, 1)} ms`;
+}
+
+function formatSignedFrames(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${formatSignedNumber(value, 2)} frames`;
+}
+
+function formatSignedCentimeters(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${formatSignedNumber(value, 2)} cm`;
+}
+
+function manualSelectionFromFrame(frame: JumpLandmarkFrame): ManualJumpEventSelection {
+  return {
+    frameIndex: frame.frameIndex,
+    playbackMs: frame.timestampMs,
+    physicalMs: frame.captureTimestampMs ?? frame.timestampMs,
+  };
+}
+
+function clampAnalysisStart(valueMs: number, endMs: number, durationMs: number): number {
+  return Math.max(0, Math.min(valueMs, Math.max(0, Math.min(endMs - MIN_ANALYSIS_WINDOW_MS, durationMs))));
+}
+
+function clampAnalysisEnd(valueMs: number, startMs: number, durationMs: number): number {
+  return Math.min(durationMs, Math.max(valueMs, Math.min(durationMs, startMs + MIN_ANALYSIS_WINDOW_MS)));
+}
+
+function phaseColor(phase: JumpPhaseSample['phase'] | null): string {
   switch (phase) {
     case 'GROUND_CONTACT':
       return '#22c55e';
@@ -181,6 +249,39 @@ function summaryColor(result: JumpAnalysisResult | null): string {
   return result.invalidReason ? '#f97316' : '#22c55e';
 }
 
+function formatQualityFlag(flag: string): string {
+  switch (flag) {
+    case 'INSUFFICIENT_FULL_BODY_VISIBILITY':
+      return 'Full body or face not visible enough';
+    case 'INSUFFICIENT_FEET_VISIBILITY':
+      return 'Feet tracking insufficient';
+    case 'UNSTABLE_CALIBRATION':
+      return 'Calibration unstable';
+    case 'LOW_CONFIDENCE':
+      return 'Low landmark confidence';
+    case 'UNCERTAIN_TRACKING':
+      return 'Tracking uncertain';
+    case 'PARTIAL_FEET_VISIBILITY':
+      return 'Partial feet visibility';
+    case 'PARTIAL_FULL_BODY_VISIBILITY':
+      return 'Partial full-body visibility';
+    case 'LOW_SAMPLE_FPS':
+      return 'Low sample FPS';
+    case 'CALIBRATION_NOISE':
+      return 'Calibration noise';
+    case 'EXCESS_HORIZONTAL_MOTION':
+      return 'Excess horizontal motion';
+    case 'AIRTIME_OUT_OF_RANGE':
+      return 'Airtime out of range';
+    case 'MULTI_PERSON_INPUT':
+      return 'Multiple people detected';
+    case 'NO_ANALYZED_FRAMES':
+      return 'No analyzed frames';
+    default:
+      return flag.replaceAll('_', ' ').toLowerCase();
+  }
+}
+
 function statusCopy(
   stage: JumpStage,
   countdownStep: number,
@@ -195,25 +296,54 @@ function statusCopy(
     return `Recording ${(recordingElapsedMs / 1000).toFixed(1)} s / 4.0 s`;
   }
   if (stage === 'ANALYZING') {
-    return 'Decoding frames, extracting landmarks, and measuring airtime.';
+    return 'Decoding frames, running ML Kit accurate pose detection, and measuring airtime.';
   }
   if (stage === 'REVIEW') {
-    return 'Scrub the clip or run analysis again.';
+    return 'Review the clip, set the analysis range around the jump, then run ML Kit accurate pose analysis.';
   }
   if (stage === 'RESULT_DEBUG') {
-    return 'Inspect takeoff, landing, and frame-by-frame debug overlays.';
+    return 'Review the result. Pose overlay is optional if you need to inspect landmarks.';
   }
-  return 'Recorded analysis uses VisionCamera capture and native offline landmark extraction.';
+  return 'Import a 240 fps iPhone clip or record a reference clip, then run pose analysis.';
 }
 
 interface ReviewPlayerProps {
   clip: JumpClip;
   nativeResult: JumpVideoNativeResult | null;
   analysis: JumpAnalysisResult | null;
+  manualTakeoff: ManualJumpEventSelection | null;
+  manualLanding: ManualJumpEventSelection | null;
+  analysisStartMs: number;
+  analysisEndMs: number;
+  showDebugOverlay: boolean;
+  onToggleDebugOverlay: () => void;
+  onSetAnalysisStart: (timeMs: number) => void;
+  onSetAnalysisEnd: (timeMs: number) => void;
+  onResetAnalysisRange: () => void;
+  onSetManualTakeoff: (frame: JumpLandmarkFrame) => void;
+  onSetManualLanding: (frame: JumpLandmarkFrame) => void;
+  onClearManualReview: () => void;
 }
 
-function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
+function ReviewPlayer({
+  clip,
+  nativeResult,
+  analysis,
+  manualTakeoff,
+  manualLanding,
+  analysisStartMs,
+  analysisEndMs,
+  showDebugOverlay,
+  onToggleDebugOverlay,
+  onSetAnalysisStart,
+  onSetAnalysisEnd,
+  onResetAnalysisRange,
+  onSetManualTakeoff,
+  onSetManualLanding,
+  onClearManualReview,
+}: ReviewPlayerProps) {
   const [timelineWidth, setTimelineWidth] = useState(0);
+  const [shellSize, setShellSize] = useState({ width: 0, height: 0 });
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const player = useVideoPlayer(clip.uri, (instance) => {
     instance.loop = false;
@@ -233,7 +363,10 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
   const maxPlayerHeight = Math.min(Math.max(windowHeight * 0.5, 320), 520);
   const estimatedPlayerWidth = Math.max(windowWidth - Spacing.three * 2, 240);
   const playerHeight = Math.min(estimatedPlayerWidth / aspectRatio, maxPlayerHeight);
-  const sampleFps = Math.max(nativeResult?.sampleFps ?? clip.fps ?? 30, 1);
+  const playbackSampleFps = Math.max(
+    nativeResult?.playbackSampleFps ?? nativeResult?.sampleFps ?? clip.fps ?? 30,
+    1,
+  );
   const currentFrame = useMemo(
     () => (nativeResult ? findFrameAtTime(nativeResult.frames, currentMs) : null),
     [nativeResult, currentMs],
@@ -242,6 +375,29 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
     () => (analysis ? findPhaseSampleAtTime(analysis.phaseTimeline, currentMs) : null),
     [analysis, currentMs],
   );
+  const videoFrame = useMemo(() => {
+    const containerWidth = shellSize.width || estimatedPlayerWidth;
+    const containerHeight = shellSize.height || playerHeight;
+    const containerRatio = containerWidth / Math.max(containerHeight, 1);
+
+    if (containerRatio > aspectRatio) {
+      const width = containerHeight * aspectRatio;
+      return {
+        left: (containerWidth - width) / 2,
+        top: 0,
+        width,
+        height: containerHeight,
+      };
+    }
+
+    const height = containerWidth / aspectRatio;
+    return {
+      left: 0,
+      top: (containerHeight - height) / 2,
+      width: containerWidth,
+      height,
+    };
+  }, [aspectRatio, estimatedPlayerWidth, playerHeight, shellSize.height, shellSize.width]);
 
   const seekToRatio = useCallback(
     (ratio: number) => {
@@ -249,6 +405,13 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
       player.currentTime = Math.max(0, Math.min(1, ratio)) * (durationMs / 1000);
     },
     [durationMs, player],
+  );
+  const seekToMs = useCallback(
+    (timeMs: number | null | undefined) => {
+      if (timeMs === null || timeMs === undefined || !Number.isFinite(timeMs)) return;
+      seekToRatio(timeMs / durationMs);
+    },
+    [durationMs, seekToRatio],
   );
 
   const onTimelinePress = useCallback(
@@ -262,14 +425,19 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
   const onTimelineLayout = useCallback((event: LayoutChangeEvent) => {
     setTimelineWidth(event.nativeEvent.layout.width);
   }, []);
-
+  const onPlayerShellLayout = useCallback((event: LayoutChangeEvent) => {
+    setShellSize({
+      width: event.nativeEvent.layout.width,
+      height: event.nativeEvent.layout.height,
+    });
+  }, []);
   const stepFrame = useCallback(
     (direction: -1 | 1) => {
       player.pause();
-      const nextTime = Math.max(0, currentTime + direction / sampleFps);
+      const nextTime = Math.max(0, currentTime + direction / playbackSampleFps);
       player.currentTime = nextTime;
     },
-    [currentTime, player, sampleFps],
+    [currentTime, playbackSampleFps, player],
   );
 
   const takeoffRatio =
@@ -280,21 +448,49 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
     analysis?.landingMs !== null && analysis?.landingMs !== undefined
       ? analysis.landingMs / durationMs
       : null;
+  const manualTakeoffRatio =
+    manualTakeoff && Number.isFinite(manualTakeoff.playbackMs)
+      ? manualTakeoff.playbackMs / durationMs
+      : null;
+  const manualLandingRatio =
+    manualLanding && Number.isFinite(manualLanding.playbackMs)
+      ? manualLanding.playbackMs / durationMs
+      : null;
+  const rangeStartRatio = Math.max(0, Math.min(1, analysisStartMs / durationMs));
+  const rangeEndRatio = Math.max(0, Math.min(1, analysisEndMs / durationMs));
+  const rangeWidthRatio = Math.max(0, rangeEndRatio - rangeStartRatio);
+  const isDefaultRange =
+    Math.abs(analysisStartMs) < 0.5 && Math.abs(analysisEndMs - durationMs) < 0.5;
+  const hasAlgoTakeoff =
+    analysis?.takeoffMs !== null && analysis?.takeoffMs !== undefined;
+  const hasAlgoLanding =
+    analysis?.landingMs !== null && analysis?.landingMs !== undefined;
 
   return (
     <View style={styles.playerSection}>
-      <View style={[styles.playerShell, { height: playerHeight }]}>
+      <View style={[styles.playerShell, { height: playerHeight }]} onLayout={onPlayerShellLayout}>
         <VideoView
           player={player}
           style={StyleSheet.absoluteFill}
           contentFit="contain"
           nativeControls={false}
         />
-        {nativeResult && analysis && (
-          <View pointerEvents="none" style={StyleSheet.absoluteFill}>
-            <JumpDebugOverlay frame={currentFrame} analysis={analysis} />
+        <View
+          style={[
+            styles.videoContentFrame,
+            {
+              left: videoFrame.left,
+              top: videoFrame.top,
+              width: videoFrame.width,
+              height: videoFrame.height,
+            },
+          ]}>
+          <View style={StyleSheet.absoluteFill}>
+            {nativeResult && analysis && showDebugOverlay && (
+              <JumpDebugOverlay frame={currentFrame} analysis={analysis} />
+            )}
           </View>
-        )}
+        </View>
         <View style={styles.playerMetaBadge}>
           <Text style={styles.playerMetaText}>{formatMs(currentMs)}</Text>
           <Text style={[styles.playerMetaText, { color: phaseColor(currentPhase?.phase ?? null) }]}>
@@ -304,12 +500,33 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
       </View>
 
       <Pressable style={styles.timeline} onLayout={onTimelineLayout} onPress={onTimelinePress}>
+        <View
+          style={[
+            styles.timelineRange,
+            {
+              left: `${rangeStartRatio * 100}%`,
+              width: `${Math.max(rangeWidthRatio, 0.004) * 100}%`,
+            },
+          ]}
+        />
         <View style={[styles.timelineProgress, { width: `${(currentMs / durationMs) * 100}%` }]} />
+        <View style={[styles.timelineMarker, styles.rangeStartMarker, { left: `${rangeStartRatio * 100}%` }]} />
+        <View style={[styles.timelineMarker, styles.rangeEndMarker, { left: `${rangeEndRatio * 100}%` }]} />
         {takeoffRatio !== null && (
           <View style={[styles.timelineMarker, styles.takeoffMarker, { left: `${takeoffRatio * 100}%` }]} />
         )}
         {landingRatio !== null && (
           <View style={[styles.timelineMarker, styles.landingMarker, { left: `${landingRatio * 100}%` }]} />
+        )}
+        {manualTakeoffRatio !== null && (
+          <View
+            style={[styles.timelineMarker, styles.manualTakeoffMarker, { left: `${manualTakeoffRatio * 100}%` }]}
+          />
+        )}
+        {manualLandingRatio !== null && (
+          <View
+            style={[styles.timelineMarker, styles.manualLandingMarker, { left: `${manualLandingRatio * 100}%` }]}
+          />
         )}
       </Pressable>
 
@@ -331,6 +548,147 @@ function ReviewPlayer({ clip, nativeResult, analysis }: ReviewPlayerProps) {
         <TouchableOpacity style={styles.playerControlButton} onPress={() => stepFrame(1)}>
           <Text style={styles.playerControlText}>+1 frame</Text>
         </TouchableOpacity>
+      </View>
+
+      <View style={styles.analysisRangeCard}>
+        <Text style={styles.referenceTitle}>Analysis Range</Text>
+        <Text style={styles.referenceText}>
+          Only the highlighted range is sent to ML Kit. Set start just before the still standing
+          phase, and set end just after landing.
+        </Text>
+        {clip.assetId && clip.fps >= 120 && (
+          <Text style={styles.referenceText}>
+            Slow-motion playback ranges can be longer here because the physical jump still lasts far
+            less time than the clip playback.
+          </Text>
+        )}
+        <View style={styles.analysisRangeStats}>
+          <Text style={styles.analysisRangeStat}>Start: {formatDetailedTime(analysisStartMs)}</Text>
+          <Text style={styles.analysisRangeStat}>End: {formatDetailedTime(analysisEndMs)}</Text>
+          <Text style={styles.analysisRangeStat}>
+            Window: {formatDetailedTime(Math.max(analysisEndMs - analysisStartMs, 0))}
+          </Text>
+        </View>
+        <View style={styles.playerControls}>
+          <TouchableOpacity
+            style={[styles.playerControlButton, styles.rangeActionButton]}
+            onPress={() => onSetAnalysisStart(currentMs)}>
+            <Text style={styles.playerControlText}>Set Start</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.playerControlButton, styles.rangeActionButton]}
+            onPress={() => onSetAnalysisEnd(currentMs)}>
+            <Text style={styles.playerControlText}>Set End</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.playerControlButton, isDefaultRange && styles.btnDisabled]}
+            onPress={onResetAnalysisRange}
+            disabled={isDefaultRange}>
+            <Text style={styles.playerControlText}>Reset Range</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {nativeResult && (
+        <View style={styles.eventReviewCard}>
+          <Text style={styles.referenceTitle}>Event Review</Text>
+          <Text style={styles.referenceText}>
+            Use frame-by-frame stepping, jump to the algorithm markers, and save manual takeoff and
+            landing frames from the current frame.
+          </Text>
+          <Text style={styles.analysisRangeStat}>
+            Current frame: {currentFrame ? `#${currentFrame.frameIndex}` : '—'} at {formatDetailedTime(currentFrame?.timestampMs ?? null)}
+          </Text>
+          {currentFrame && (
+            <Text style={styles.analysisRangeStat}>
+              Current physical time: {formatDetailedTime(currentFrame.captureTimestampMs ?? currentFrame.timestampMs)}
+            </Text>
+          )}
+          {manualTakeoff && (
+            <Text style={styles.analysisRangeStat}>
+              Manual takeoff marker: frame #{manualTakeoff.frameIndex} at {formatDetailedTime(manualTakeoff.playbackMs)}
+            </Text>
+          )}
+          {manualLanding && (
+            <Text style={styles.analysisRangeStat}>
+              Manual landing marker: frame #{manualLanding.frameIndex} at {formatDetailedTime(manualLanding.playbackMs)}
+            </Text>
+          )}
+          <View style={styles.playerControls}>
+            <TouchableOpacity
+              style={[styles.playerControlButton, !hasAlgoTakeoff && styles.btnDisabled]}
+              onPress={() => seekToMs(analysis?.takeoffMs)}
+              disabled={!hasAlgoTakeoff}>
+              <Text style={styles.playerControlText}>Go Algo Takeoff</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.playerControlButton, !hasAlgoLanding && styles.btnDisabled]}
+              onPress={() => seekToMs(analysis?.landingMs)}
+              disabled={!hasAlgoLanding}>
+              <Text style={styles.playerControlText}>Go Algo Landing</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.playerControls}>
+            <TouchableOpacity
+              style={[styles.playerControlButton, styles.manualTakeoffButton, !currentFrame && styles.btnDisabled]}
+              onPress={() => currentFrame && onSetManualTakeoff(currentFrame)}
+              disabled={!currentFrame}>
+              <Text style={styles.playerControlText}>Mark Manual Takeoff</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.playerControlButton, styles.manualLandingButton, !currentFrame && styles.btnDisabled]}
+              onPress={() => currentFrame && onSetManualLanding(currentFrame)}
+              disabled={!currentFrame}>
+              <Text style={styles.playerControlText}>Mark Manual Landing</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.playerControls}>
+            <TouchableOpacity
+              style={[styles.playerControlButton, !manualTakeoff && styles.btnDisabled]}
+              onPress={() => seekToMs(manualTakeoff?.playbackMs)}
+              disabled={!manualTakeoff}>
+              <Text style={styles.playerControlText}>Go Manual Takeoff</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.playerControlButton, !manualLanding && styles.btnDisabled]}
+              onPress={() => seekToMs(manualLanding?.playbackMs)}
+              disabled={!manualLanding}>
+              <Text style={styles.playerControlText}>Go Manual Landing</Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity
+            style={[
+              styles.floorModeButton,
+              styles.clearManualButton,
+              !manualTakeoff && !manualLanding && styles.btnDisabled,
+            ]}
+            onPress={onClearManualReview}
+            disabled={!manualTakeoff && !manualLanding}>
+            <Text style={styles.floorModeButtonText}>Clear Manual Review</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      <View style={styles.floorCalibrationCard}>
+        <Text style={styles.referenceTitle}>ML Kit Accurate Overlay</Text>
+        <Text style={styles.referenceText}>
+          The overlay draws ML Kit landmarks over the current frame. Use it to confirm the face,
+          shoulders, hips, knees, ankles, heels, and toes stay tracked through takeoff and landing.
+        </Text>
+        <View style={styles.floorAdjustRow}>
+          {analysis && (
+            <TouchableOpacity style={styles.floorModeButton} onPress={onToggleDebugOverlay}>
+              <Text style={styles.floorModeButtonText}>
+                {showDebugOverlay ? 'Hide Pose Overlay' : 'Show Pose Overlay'}
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+        {showDebugOverlay && analysis && (
+          <Text style={styles.referenceText}>
+            Blue dashed line: average toe baseline from the standing calibration window.
+          </Text>
+        )}
       </View>
     </View>
   );
@@ -354,6 +712,11 @@ export default function JumpDetectorScreen() {
   const [clip, setClip] = useState<JumpClip | null>(null);
   const [nativeResult, setNativeResult] = useState<JumpVideoNativeResult | null>(null);
   const [analysis, setAnalysis] = useState<JumpAnalysisResult | null>(null);
+  const [manualTakeoff, setManualTakeoff] = useState<ManualJumpEventSelection | null>(null);
+  const [manualLanding, setManualLanding] = useState<ManualJumpEventSelection | null>(null);
+  const [analysisStartMs, setAnalysisStartMs] = useState(0);
+  const [analysisEndMs, setAnalysisEndMs] = useState(0);
+  const [showDebugOverlay, setShowDebugOverlay] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const format = useMemo(() => selectFpsFirstFormat(device), [device]);
@@ -391,6 +754,11 @@ export default function JumpDetectorScreen() {
     setClip(null);
     setNativeResult(null);
     setAnalysis(null);
+    setManualTakeoff(null);
+    setManualLanding(null);
+    setAnalysisStartMs(0);
+    setAnalysisEndMs(0);
+    setShowDebugOverlay(false);
     setError(null);
     setStage('SETUP');
   }, [clearCountdown, clearRecordingTimers]);
@@ -439,7 +807,7 @@ export default function JumpDetectorScreen() {
         recordingActiveRef.current = false;
         recordingStartedAtRef.current = null;
         const nextClip: JumpClip = {
-          uri: normalizeFileUri(video.path),
+          uri: normalizeMediaUri(video.path),
           fps: captureFps,
           durationMs: Math.round(video.duration * 1000),
           width: video.width,
@@ -450,6 +818,12 @@ export default function JumpDetectorScreen() {
           setClip(nextClip);
           setNativeResult(null);
           setAnalysis(null);
+          setManualTakeoff(null);
+          setManualLanding(null);
+          setAnalysisStartMs(0);
+          setAnalysisEndMs(nextClip.durationMs);
+          setShowDebugOverlay(false);
+          setError(null);
           setStage('REVIEW');
         });
       },
@@ -470,6 +844,10 @@ export default function JumpDetectorScreen() {
     setClip(null);
     setNativeResult(null);
     setAnalysis(null);
+    setManualTakeoff(null);
+    setManualLanding(null);
+    setAnalysisStartMs(0);
+    setAnalysisEndMs(0);
     setCountdownStep(0);
     setRecordingElapsedMs(0);
     setStage('COUNTDOWN');
@@ -478,21 +856,52 @@ export default function JumpDetectorScreen() {
   const analyzeClip = useCallback(async () => {
     if (!clip) return;
 
+    const durationMs = Math.max(clip.durationMs, 1);
+    const clampedStartMs = clampAnalysisStart(analysisStartMs, analysisEndMs, durationMs);
+    const clampedEndMs = clampAnalysisEnd(analysisEndMs, clampedStartMs, durationMs);
+    const analysisWindowMs = clampedEndMs - clampedStartMs;
+    const maxAllowedWindowMs =
+      clip.assetId && clip.fps >= 120
+        ? MAX_SLOW_MO_PLAYBACK_WINDOW_MS
+        : MAX_STANDARD_ANALYSIS_WINDOW_MS;
+
+    if (analysisWindowMs < MIN_ANALYSIS_WINDOW_MS) {
+      setError('Select a longer analysis range so the clip includes the still standing phase and landing.');
+      setStage('REVIEW');
+      return;
+    }
+
+    if (analysisWindowMs > maxAllowedWindowMs) {
+      setError(
+        clip.assetId && clip.fps >= 120
+          ? 'Select a shorter slow-motion playback range around a single jump attempt before running analysis.'
+          : 'Select a shorter analysis range around a single jump attempt before running analysis.',
+      );
+      setStage('REVIEW');
+      return;
+    }
+
     setError(null);
+    setManualTakeoff(null);
+    setManualLanding(null);
     setStage('ANALYZING');
 
     try {
+      const requestedSampleFps = clip.fps > 60 ? clip.fps : 60;
+      const requestedMaxFrames = Math.ceil((requestedSampleFps * analysisWindowMs) / 1000) + 12;
       const native = await analyzeRecordedJumpVideo(clip, {
-        sampleFps: 60,
-        maxFrames: 360,
-        minConfidence: 0.2,
+        sampleFps: requestedSampleFps,
+        maxFrames: requestedMaxFrames,
+        analysisStartMs: clampedStartMs,
+        analysisEndMs: clampedEndMs,
       });
       const nextAnalysis = analyzeJumpLandmarks(native.frames, {
         videoDurationMs: native.videoDurationMs,
         videoFps: native.videoFps,
         sampleFps: native.sampleFps,
+        playbackVideoFps: native.playbackVideoFps,
+        playbackSampleFps: native.playbackSampleFps,
         personCountSummary: native.personCountSummary,
-        minConfidence: 0.2,
       });
 
       startTransition(() => {
@@ -504,7 +913,114 @@ export default function JumpDetectorScreen() {
       setError((analysisError as Error).message);
       setStage('REVIEW');
     }
-  }, [clip]);
+  }, [analysisEndMs, analysisStartMs, clip]);
+
+  const toggleDebugOverlay = useCallback(() => {
+    setShowDebugOverlay((value) => !value);
+  }, []);
+
+  const updateAnalysisRange = useCallback(
+    (nextStartMs: number, nextEndMs: number) => {
+      if (!clip) return;
+      const durationMs = Math.max(clip.durationMs, 1);
+      const clampedStartMs = clampAnalysisStart(nextStartMs, nextEndMs, durationMs);
+      const clampedEndMs = clampAnalysisEnd(nextEndMs, clampedStartMs, durationMs);
+
+      setAnalysisStartMs(clampedStartMs);
+      setAnalysisEndMs(clampedEndMs);
+      setNativeResult(null);
+      setAnalysis(null);
+      setManualTakeoff(null);
+      setManualLanding(null);
+      setShowDebugOverlay(false);
+      setError(null);
+      setStage('REVIEW');
+    },
+    [clip],
+  );
+
+  const setRangeStartAt = useCallback(
+    (timeMs: number) => {
+      if (!clip) return;
+      updateAnalysisRange(timeMs, analysisEndMs || clip.durationMs);
+    },
+    [analysisEndMs, clip, updateAnalysisRange],
+  );
+
+  const setRangeEndAt = useCallback(
+    (timeMs: number) => {
+      if (!clip) return;
+      updateAnalysisRange(analysisStartMs, timeMs);
+    },
+    [analysisStartMs, clip, updateAnalysisRange],
+  );
+
+  const resetAnalysisRange = useCallback(() => {
+    if (!clip) return;
+    updateAnalysisRange(0, clip.durationMs);
+  }, [clip, updateAnalysisRange]);
+
+  const setManualTakeoffFromFrame = useCallback((frame: JumpLandmarkFrame) => {
+    setManualTakeoff(manualSelectionFromFrame(frame));
+  }, []);
+
+  const setManualLandingFromFrame = useCallback((frame: JumpLandmarkFrame) => {
+    setManualLanding(manualSelectionFromFrame(frame));
+  }, []);
+
+  const clearManualReview = useCallback(() => {
+    setManualTakeoff(null);
+    setManualLanding(null);
+  }, []);
+
+  const importVideo = useCallback(async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission required', 'Photo library access is needed to import videos.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['videos'],
+      quality: 1,
+      preferredAssetRepresentationMode:
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current,
+      videoExportPreset: ImagePicker.VideoExportPreset.Passthrough,
+    });
+
+    if (result.canceled || result.assets.length === 0) return;
+
+    const asset = result.assets[0];
+    const uri = normalizeMediaUri(asset.uri);
+    const width = asset.width ?? 0;
+    const height = asset.height ?? 0;
+    const durationMs = Math.round(asset.duration ?? 0);
+
+    // Default to 240 fps for imported slow-motion videos.
+    // The native analyzer reads the actual fps from the file metadata.
+    const importedClip: JumpClip = {
+      uri,
+      assetId: asset.assetId ?? null,
+      fps: 240,
+      durationMs,
+      width,
+      height,
+      recordedAt: new Date().toISOString(),
+    };
+
+    startTransition(() => {
+      setClip(importedClip);
+      setNativeResult(null);
+      setAnalysis(null);
+      setManualTakeoff(null);
+      setManualLanding(null);
+      setAnalysisStartMs(0);
+      setAnalysisEndMs(importedClip.durationMs);
+      setShowDebugOverlay(false);
+      setError(null);
+      setStage('REVIEW');
+    });
+  }, []);
 
   useEffect(() => {
     if (stage !== 'COUNTDOWN') return;
@@ -534,6 +1050,53 @@ export default function JumpDetectorScreen() {
       cancelPromise?.catch(() => undefined);
     }
   }, [isFocused]);
+
+  const manualReview = useMemo(() => {
+    if (!manualTakeoff || !manualLanding) return null;
+    if (manualLanding.physicalMs <= manualTakeoff.physicalMs) return null;
+
+    const flightPhysicalMs = manualLanding.physicalMs - manualTakeoff.physicalMs;
+    const heightCm = heightFromFlightTime(flightPhysicalMs);
+    const playbackFps =
+      nativeResult?.playbackSampleFps ?? nativeResult?.sampleFps ?? clip?.fps ?? null;
+    const msPerPlaybackFrame =
+      playbackFps && playbackFps > 0 ? 1000 / playbackFps : null;
+    const takeoffDeltaMs =
+      analysis?.takeoffMs !== null && analysis?.takeoffMs !== undefined
+        ? manualTakeoff.playbackMs - analysis.takeoffMs
+        : null;
+    const landingDeltaMs =
+      analysis?.landingMs !== null && analysis?.landingMs !== undefined
+        ? manualLanding.playbackMs - analysis.landingMs
+        : null;
+    const takeoffDeltaFrames =
+      takeoffDeltaMs !== null && msPerPlaybackFrame ? takeoffDeltaMs / msPerPlaybackFrame : null;
+    const landingDeltaFrames =
+      landingDeltaMs !== null && msPerPlaybackFrame ? landingDeltaMs / msPerPlaybackFrame : null;
+    const flightDeltaMs =
+      analysis?.flightMs !== null && analysis?.flightMs !== undefined
+        ? flightPhysicalMs - analysis.flightMs
+        : null;
+    const heightDeltaCm =
+      analysis?.heightCm !== null && analysis?.heightCm !== undefined
+        ? heightCm - analysis.heightCm
+        : null;
+
+    return {
+      flightPhysicalMs,
+      heightCm,
+      takeoffDeltaMs,
+      landingDeltaMs,
+      takeoffDeltaFrames,
+      landingDeltaFrames,
+      flightDeltaMs,
+      heightDeltaCm,
+    };
+  }, [analysis, clip?.fps, manualLanding, manualTakeoff, nativeResult]);
+  const manualReviewHasInvalidOrder =
+    manualTakeoff !== null &&
+    manualLanding !== null &&
+    manualLanding.physicalMs <= manualTakeoff.physicalMs;
 
   if (Platform.OS !== 'ios') {
     return (
@@ -570,14 +1133,20 @@ export default function JumpDetectorScreen() {
     <View style={styles.statusCard}>
       <View style={styles.statusRow}>
         <Text style={styles.stageText}>{stageLabel(stage)}</Text>
-        <Text style={styles.stageSubText}>{captureFps} fps capture target</Text>
+        <Text style={styles.stageSubText}>
+          {showRecordedReview && nativeResult
+            ? `${(nativeResult.playbackSampleFps ?? nativeResult.sampleFps).toFixed(0)} fps playback / ${nativeResult.videoFps.toFixed(0)} fps effective`
+            : showRecordedReview && clip
+              ? `${clip.fps} fps source`
+              : `${captureFps} fps capture target`}
+        </Text>
       </View>
       <Text style={[styles.statusHeadline, error && styles.errorText]}>
         {statusCopy(stage, countdownStep, recordingElapsedMs, error)}
       </Text>
       {!nativeAnalysisAvailable && (
         <Text style={styles.warningText}>
-          Native analyzer unavailable. Rebuild the iOS development client so the local Expo module
+          Native analyzer unavailable. Rebuild the iOS development client so the local ML Kit module
           is included.
         </Text>
       )}
@@ -593,7 +1162,7 @@ export default function JumpDetectorScreen() {
         ]}
         onPress={() => void analyzeClip()}
         disabled={stage === 'ANALYZING' || !nativeAnalysisAvailable}>
-        <Text style={styles.btnText}>{analysis ? 'Re-analyze Clip' : 'Analyze Clip'}</Text>
+        <Text style={styles.btnText}>{analysis ? 'Re-analyze Range' : 'Analyze Range'}</Text>
       </TouchableOpacity>
       <TouchableOpacity style={[styles.btn, styles.btnSecondary]} onPress={resetSession}>
         <Text style={styles.btnText}>Retake</Text>
@@ -602,15 +1171,44 @@ export default function JumpDetectorScreen() {
   ) : null;
   const reviewContent = clip ? (
     <View style={styles.reviewCards}>
-      <ReviewPlayer clip={clip} nativeResult={nativeResult} analysis={analysis} />
+      <ReviewPlayer
+        clip={clip}
+        nativeResult={nativeResult}
+        analysis={analysis}
+        manualTakeoff={manualTakeoff}
+        manualLanding={manualLanding}
+        analysisStartMs={analysisStartMs}
+        analysisEndMs={analysisEndMs}
+        showDebugOverlay={showDebugOverlay}
+        onToggleDebugOverlay={toggleDebugOverlay}
+        onSetAnalysisStart={setRangeStartAt}
+        onSetAnalysisEnd={setRangeEndAt}
+        onResetAnalysisRange={resetAnalysisRange}
+        onSetManualTakeoff={setManualTakeoffFromFrame}
+        onSetManualLanding={setManualLandingFromFrame}
+        onClearManualReview={clearManualReview}
+      />
 
       <View style={styles.resultCard}>
         <Text style={[styles.resultHeadline, { color: summaryColor(analysis) }]}>
           {analysis?.invalidReason ? 'Invalid attempt' : analysis ? 'Measured jump' : 'Recorded clip'}
         </Text>
-        <Text style={styles.resultLine}>Takeoff: {formatMs(analysis?.takeoffMs ?? null)}</Text>
-        <Text style={styles.resultLine}>Landing: {formatMs(analysis?.landingMs ?? null)}</Text>
-        <Text style={styles.resultLine}>Flight: {formatMs(analysis?.flightMs ?? null)}</Text>
+        <Text style={styles.resultLine}>
+          Takeoff playback: {formatDetailedTime(analysis?.takeoffMs ?? null)}
+        </Text>
+        <Text style={styles.resultLine}>
+          Landing playback: {formatDetailedTime(analysis?.landingMs ?? null)}
+        </Text>
+        <Text style={styles.resultLine}>
+          Takeoff physical: {formatDetailedTime(analysis?.takeoffPhysicalMs ?? null)}
+        </Text>
+        <Text style={styles.resultLine}>
+          Landing physical: {formatDetailedTime(analysis?.landingPhysicalMs ?? null)}
+        </Text>
+        <Text style={styles.resultLine}>Flight physical: {formatDetailedTime(analysis?.flightMs ?? null)}</Text>
+        <Text style={styles.resultLine}>
+          Analysis range: {formatDetailedTime(analysisStartMs)} → {formatDetailedTime(analysisEndMs)}
+        </Text>
         <Text style={styles.resultLine}>
           Height:{' '}
           {analysis?.heightCm !== null && analysis?.heightCm !== undefined
@@ -618,39 +1216,138 @@ export default function JumpDetectorScreen() {
             : '—'}
         </Text>
         <Text style={styles.resultLine}>Quality: {analysis?.quality ?? '—'}</Text>
+        <Text style={styles.resultLine}>
+          Precision: {formatFramePrecision(nativeResult?.sampleFps ?? clip.fps)}
+        </Text>
         <Text style={styles.resultSummary}>
           {analysis
             ? explainJumpAnalysis(analysis)
-            : 'Run analysis to extract landmarks and event timings.'}
+            : 'Run analysis to extract full-body landmarks and event timings.'}
         </Text>
+        {clip.assetId &&
+          nativeResult &&
+          (nativeResult.playbackVideoFps ?? nativeResult.videoFps) <= 60 &&
+          nativeResult.videoFps <= 60 &&
+          clip.fps >= 240 && (
+          <Text style={styles.resultSummary}>
+            The imported Photos asset still resolved to a {nativeResult.videoFps.toFixed(0)} fps
+            playback file. Re-import the original slow-motion asset from Photos without editing if
+            height remains invalid.
+          </Text>
+        )}
+        {analysis?.invalidReason === 'FEET_NOT_VISIBLE' && (
+          <Text style={styles.resultSummary}>
+            Detector coverage: {((analysis.debug.feetVisibleRatio ?? 0) * 100).toFixed(0)}% of
+            frames with the feet tracked.
+          </Text>
+        )}
+        {analysis?.invalidReason === 'BODY_NOT_FULLY_VISIBLE' && (
+          <Text style={styles.resultSummary}>
+            Full-body coverage: {((analysis.debug.fullBodyVisibleRatio ?? 0) * 100).toFixed(0)}%
+            of frames with face, torso, hips, and feet all visible.
+          </Text>
+        )}
         {analysis?.qualityFlags && (
-          <Text style={styles.resultFlags}>Flags: {analysis.qualityFlags.join(', ')}</Text>
+          <Text style={styles.resultFlags}>
+            Flags: {analysis.qualityFlags.map(formatQualityFlag).join(', ')}
+          </Text>
         )}
       </View>
 
-      {(analysis || nativeResult) && (
+      <View style={styles.debugCard}>
+        <Text style={styles.referenceTitle}>Manual Review</Text>
+        <Text style={styles.referenceText}>
+          Mark the exact current frame for takeoff and landing, then compare the manual result to
+          the algorithm output.
+        </Text>
+        <Text style={styles.referenceText}>
+          Manual takeoff: {manualTakeoff ? `frame #${manualTakeoff.frameIndex} at ${formatDetailedTime(manualTakeoff.playbackMs)}` : '—'}
+        </Text>
+        <Text style={styles.referenceText}>
+          Manual landing: {manualLanding ? `frame #${manualLanding.frameIndex} at ${formatDetailedTime(manualLanding.playbackMs)}` : '—'}
+        </Text>
+        {manualReview ? (
+          <>
+            <Text style={styles.referenceText}>
+              Manual takeoff physical: {formatDetailedTime(manualTakeoff?.physicalMs ?? null)}
+            </Text>
+            <Text style={styles.referenceText}>
+              Manual landing physical: {formatDetailedTime(manualLanding?.physicalMs ?? null)}
+            </Text>
+            <Text style={styles.referenceText}>
+              Manual flight physical: {formatDetailedTime(manualReview.flightPhysicalMs)}
+            </Text>
+            <Text style={styles.referenceText}>
+              Manual height: {manualReview.heightCm.toFixed(1)} cm
+            </Text>
+            <Text style={styles.referenceText}>
+              Takeoff delta: {formatSignedMilliseconds(manualReview.takeoffDeltaMs)} / {formatSignedFrames(manualReview.takeoffDeltaFrames)}
+            </Text>
+            <Text style={styles.referenceText}>
+              Landing delta: {formatSignedMilliseconds(manualReview.landingDeltaMs)} / {formatSignedFrames(manualReview.landingDeltaFrames)}
+            </Text>
+            <Text style={styles.referenceText}>
+              Flight delta: {formatSignedMilliseconds(manualReview.flightDeltaMs)}
+            </Text>
+            <Text style={styles.referenceText}>
+              Height delta: {formatSignedCentimeters(manualReview.heightDeltaCm)}
+            </Text>
+          </>
+        ) : manualReviewHasInvalidOrder ? (
+          <Text style={styles.referenceText}>
+            Manual landing must be after manual takeoff. Re-mark one of the events from the player.
+          </Text>
+        ) : (
+          <Text style={styles.referenceText}>
+            Mark both manual events from the player to compute manual flight time, manual height,
+            and deltas versus the algorithm.
+          </Text>
+        )}
+      </View>
+
+      {analysis && (
         <View style={styles.debugCard}>
           <Text style={styles.referenceTitle}>Debug Metrics</Text>
-          <Text style={styles.referenceText}>
-            Frames: {analysis?.debug.analyzedFrameCount ?? nativeResult?.frames.length ?? 0}
-          </Text>
-          <Text style={styles.referenceText}>
-            Sample FPS: {(analysis?.debug.sampleFps ?? nativeResult?.sampleFps ?? clip.fps).toFixed(1)}
-          </Text>
-          <Text style={styles.referenceText}>
-            Avg confidence: {(analysis?.debug.averageConfidence ?? 0).toFixed(2)}
-          </Text>
-          <Text style={styles.referenceText}>
-            Feet visible: {((analysis?.debug.feetVisibleRatio ?? 0) * 100).toFixed(0)}%
-          </Text>
-          <Text style={styles.referenceText}>
-            Full body visible: {((analysis?.debug.fullBodyVisibleRatio ?? 0) * 100).toFixed(0)}%
-          </Text>
-          <Text style={styles.referenceText}>
-            Horizontal drift: {((analysis?.debug.maxHorizontalDrift ?? 0) * 100).toFixed(1)}%
-          </Text>
-        </View>
-      )}
+                  <Text style={styles.referenceText}>
+                    Frames: {analysis?.debug.analyzedFrameCount ?? nativeResult?.frames.length ?? 0}
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Calibration end: {formatDetailedTime(analysis?.debug.calibrationEndMs ?? null)}
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Sample FPS: {(analysis?.debug.sampleFps ?? nativeResult?.sampleFps ?? clip.fps).toFixed(1)}
+                  </Text>
+                  {nativeResult?.playbackSampleFps && (
+                    <Text style={styles.referenceText}>
+                      Playback FPS: {nativeResult.playbackSampleFps.toFixed(1)}
+                    </Text>
+                  )}
+                  {analysis?.debug.slowMotionScaleFactor && (
+                    <Text style={styles.referenceText}>
+                      Slow-motion scale factor:{' '}
+                      {(1 / analysis.debug.slowMotionScaleFactor).toFixed(2)}x capture vs playback
+                    </Text>
+                  )}
+                  <Text style={styles.referenceText}>
+                    Frame interval: {formatFramePrecision(analysis?.debug.sampleFps ?? nativeResult?.sampleFps ?? clip.fps)}
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Avg confidence: {(analysis?.debug.averageConfidence ?? 0).toFixed(2)}
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Full body visible: {((analysis?.debug.fullBodyVisibleRatio ?? 0) * 100).toFixed(0)}%
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Feet visible: {((analysis?.debug.feetVisibleRatio ?? 0) * 100).toFixed(0)}%
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Horizontal drift: {((analysis?.debug.maxHorizontalDrift ?? 0) * 100).toFixed(1)}%
+                  </Text>
+                  <Text style={styles.referenceText}>
+                    Calibration stability: {((analysis?.debug.calibrationStability ?? 0) * 100).toFixed(2)}%
+                  </Text>
+                </View>
+              )}
     </View>
   ) : null;
 
@@ -696,8 +1393,8 @@ export default function JumpDetectorScreen() {
               </View>
               <View style={styles.referenceCard}>
                 <Text style={styles.referenceTitle}>Capture Contract</Text>
-                <Text style={styles.referenceText}>Rear camera. Side profile. Fixed support.</Text>
-                <Text style={styles.referenceText}>Full body, feet, and floor visible throughout.</Text>
+                <Text style={styles.referenceText}>iPhone slow-motion preferred. Use fixed support if recording in-app.</Text>
+                <Text style={styles.referenceText}>Keep the face, hips, knees, ankles, and both feet visible for the whole jump.</Text>
               </View>
               <View style={styles.btnRow}>
                 <TouchableOpacity
@@ -712,6 +1409,13 @@ export default function JumpDetectorScreen() {
                   <Text style={styles.btnText}>{stage === 'RECORDING' ? 'Stop Early' : 'Reset'}</Text>
                 </TouchableOpacity>
               </View>
+              {stage === 'SETUP' && (
+                <TouchableOpacity
+                  style={[styles.btn, styles.btnImport]}
+                  onPress={() => void importVideo()}>
+                  <Text style={styles.btnText}>Import Full-Body 240 fps Video</Text>
+                </TouchableOpacity>
+              )}
             </>
           )}
         </View>
@@ -900,6 +1604,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(148,163,184,0.25)',
   },
+  btnImport: {
+    backgroundColor: 'rgba(99,102,241,0.85)',
+  },
   btnDisabled: {
     opacity: 0.45,
   },
@@ -922,6 +1629,10 @@ const styles = StyleSheet.create({
     backgroundColor: '#000000',
     borderWidth: 1,
     borderColor: 'rgba(148,163,184,0.25)',
+  },
+  videoContentFrame: {
+    position: 'absolute',
+    overflow: 'hidden',
   },
   playerMetaBadge: {
     position: 'absolute',
@@ -954,6 +1665,12 @@ const styles = StyleSheet.create({
     bottom: 0,
     backgroundColor: '#38bdf8',
   },
+  timelineRange: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(168,85,247,0.28)',
+  },
   timelineMarker: {
     position: 'absolute',
     top: 0,
@@ -961,11 +1678,23 @@ const styles = StyleSheet.create({
     width: 3,
     marginLeft: -1.5,
   },
+  rangeStartMarker: {
+    backgroundColor: '#a78bfa',
+  },
+  rangeEndMarker: {
+    backgroundColor: '#e879f9',
+  },
   takeoffMarker: {
     backgroundColor: '#22c55e',
   },
   landingMarker: {
     backgroundColor: '#f97316',
+  },
+  manualTakeoffMarker: {
+    backgroundColor: '#14b8a6',
+  },
+  manualLandingMarker: {
+    backgroundColor: '#facc15',
   },
   playerControls: {
     flexDirection: 'row',
@@ -988,6 +1717,66 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 13,
     fontWeight: '700',
+  },
+  analysisRangeCard: {
+    backgroundColor: 'rgba(15,23,42,0.92)',
+    borderRadius: 18,
+    padding: Spacing.three,
+    gap: Spacing.two,
+  },
+  analysisRangeStats: {
+    gap: Spacing.one,
+  },
+  analysisRangeStat: {
+    color: '#cbd5e1',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  eventReviewCard: {
+    backgroundColor: 'rgba(15,23,42,0.92)',
+    borderRadius: 18,
+    padding: Spacing.three,
+    gap: Spacing.two,
+  },
+  rangeActionButton: {
+    backgroundColor: 'rgba(76,29,149,0.88)',
+  },
+  manualTakeoffButton: {
+    backgroundColor: 'rgba(13,148,136,0.88)',
+  },
+  manualLandingButton: {
+    backgroundColor: 'rgba(202,138,4,0.88)',
+  },
+  clearManualButton: {
+    backgroundColor: 'rgba(51,65,85,0.98)',
+  },
+  floorCalibrationCard: {
+    backgroundColor: 'rgba(15,23,42,0.92)',
+    borderRadius: 18,
+    padding: Spacing.three,
+    gap: Spacing.two,
+  },
+  floorAdjustRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+  },
+  floorModeButton: {
+    flex: 1,
+    minHeight: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+    backgroundColor: 'rgba(30,41,59,0.96)',
+    borderWidth: 1,
+    borderColor: 'rgba(148,163,184,0.24)',
+  },
+  floorModeButtonText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+    textAlign: 'center',
   },
   resultCard: {
     backgroundColor: 'rgba(15,23,42,0.9)',

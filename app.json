@@ -13,6 +13,8 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSCameraUsageDescription": "Hexfit needs camera access to measure your jump height using pose estimation.",
+        "NSPhotoLibraryUsageDescription": "Hexfit needs photo library access to import a slow-motion jump video for analysis.",
+        "NSPhotoLibraryAddUsageDescription": "Hexfit may save exported jump analysis clips to your photo library.",
         "ITSAppUsesNonExemptEncryption": false
       },
       "bundleIdentifier": "com.aray11.hexfitcam"
@@ -40,6 +42,7 @@
         "expo-build-properties",
         {
           "ios": {
+            "deploymentTarget": "15.5",
             "useFrameworks": "static",
             "buildReactNativeFromSource": true
           }
@@ -64,7 +67,21 @@
           }
         }
       ],
-      "expo-video"
+      "expo-video",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "The app accesses your photos to let you share them with your friends.",
+          "colors": {
+            "cropToolbarColor": "#000000"
+          },
+          "dark": {
+            "colors": {
+              "cropToolbarColor": "#000000"
+            }
+          }
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

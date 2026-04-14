@@ -18,6 +18,11 @@ const TAKEOFF_THRESHOLD = 0.04;
 const LANDING_THRESHOLD = 0.02;
 const TAKEOFF_CONFIRM_FRAMES = 2;
 const LANDING_CONFIRM_FRAMES = 2;
+const MIN_FULL_BODY_VISIBLE_RATIO = 0.6;
+/** Allow this many consecutive untracked frames without resetting takeoff
+ *  confirmation.  Fast upward motion commonly causes brief tracking loss
+ *  that should not invalidate the takeoff signal. */
+const MAX_TAKEOFF_GAP_FRAMES = 4;
 const MIN_FLIGHT_MS = 180;
 const MAX_FLIGHT_MS = 900;
 const MAX_CALIBRATION_CENTER_RANGE = 0.12;
@@ -28,6 +33,8 @@ interface AnalysisOptions {
   videoDurationMs?: number;
   videoFps?: number;
   sampleFps?: number;
+  playbackVideoFps?: number;
+  playbackSampleFps?: number;
   personCountSummary?: JumpPersonCountSummary;
   minConfidence?: number;
 }
@@ -35,10 +42,19 @@ interface AnalysisOptions {
 interface FrameSignals {
   frameIndex: number;
   timestampMs: number;
+  captureTimestampMs: number;
   avgConfidence: number;
   personCount: number;
+  faceVisible: boolean;
   fullBodyVisible: boolean;
+  /** At least one toe (foot index) or ankle is visible. */
   feetVisible: boolean;
+  leftToeY: number | null;
+  rightToeY: number | null;
+  leftHeelY: number | null;
+  rightHeelY: number | null;
+  leftKneeY: number | null;
+  rightKneeY: number | null;
   leftAnkleY: number | null;
   rightAnkleY: number | null;
   hipY: number | null;
@@ -48,6 +64,10 @@ interface FrameSignals {
 }
 
 interface Baseline {
+  leftToeY: number;
+  rightToeY: number;
+  leftGroundY: number;
+  rightGroundY: number;
   leftAnkleY: number;
   rightAnkleY: number;
   hipY: number;
@@ -55,6 +75,11 @@ interface Baseline {
   centerX: number;
   calibrationEndMs: number;
   stability: number;
+}
+
+interface CalibrationCandidate {
+  frames: FrameSignals[];
+  endMs: number;
 }
 
 function clamp01(value: number): number {
@@ -112,6 +137,20 @@ function midpointX(
   return null;
 }
 
+function last<T>(values: T[]): T | undefined {
+  return values[values.length - 1];
+}
+
+function bestFootGroundY(
+  toeY: number | null,
+  heelY: number | null,
+  ankleY: number | null,
+): number | null {
+  const values = [toeY, heelY, ankleY].filter((value): value is number => value !== null);
+  if (values.length === 0) return null;
+  return Math.max(...values);
+}
+
 function medianNullable(values: Array<number | null>, index: number): number | null {
   const nearby: number[] = [];
   for (let offset = -1; offset <= 1; offset += 1) {
@@ -124,6 +163,10 @@ function medianNullable(values: Array<number | null>, index: number): number | n
 }
 
 function applyMedianFilter(samples: FrameSignals[]): FrameSignals[] {
+  const leftToeSeries = samples.map((sample) => sample.leftToeY);
+  const rightToeSeries = samples.map((sample) => sample.rightToeY);
+  const leftHeelSeries = samples.map((sample) => sample.leftHeelY);
+  const rightHeelSeries = samples.map((sample) => sample.rightHeelY);
   const leftSeries = samples.map((sample) => sample.leftAnkleY);
   const rightSeries = samples.map((sample) => sample.rightAnkleY);
   const hipSeries = samples.map((sample) => sample.hipY);
@@ -132,6 +175,10 @@ function applyMedianFilter(samples: FrameSignals[]): FrameSignals[] {
 
   return samples.map((sample, index) => ({
     ...sample,
+    leftToeY: medianNullable(leftToeSeries, index),
+    rightToeY: medianNullable(rightToeSeries, index),
+    leftHeelY: medianNullable(leftHeelSeries, index),
+    rightHeelY: medianNullable(rightHeelSeries, index),
     leftAnkleY: medianNullable(leftSeries, index),
     rightAnkleY: medianNullable(rightSeries, index),
     hipY: medianNullable(hipSeries, index),
@@ -140,7 +187,19 @@ function applyMedianFilter(samples: FrameSignals[]): FrameSignals[] {
   }));
 }
 
-function applyEma(samples: FrameSignals[], alpha = 0.58): FrameSignals[] {
+function emaStep(current: number | null, prev: number | null, alpha: number): number | null {
+  if (current === null) return null;
+  if (prev === null) return current;
+  return alpha * current + (1 - alpha) * prev;
+}
+
+// Keep EMA effectively pass-through in the timing path. A slower EMA reduces
+// jitter, but it also shifts touchdown later by one or more 240 fps frames.
+function applyEma(samples: FrameSignals[], alpha = 1): FrameSignals[] {
+  let leftToePrev: number | null = null;
+  let rightToePrev: number | null = null;
+  let leftHeelPrev: number | null = null;
+  let rightHeelPrev: number | null = null;
   let leftPrev: number | null = null;
   let rightPrev: number | null = null;
   let hipPrev: number | null = null;
@@ -148,37 +207,20 @@ function applyEma(samples: FrameSignals[], alpha = 0.58): FrameSignals[] {
   let centerPrev: number | null = null;
 
   return samples.map((sample) => {
-    const nextLeft =
-      sample.leftAnkleY === null
-        ? null
-        : leftPrev === null
-          ? sample.leftAnkleY
-          : alpha * sample.leftAnkleY + (1 - alpha) * leftPrev;
-    const nextRight =
-      sample.rightAnkleY === null
-        ? null
-        : rightPrev === null
-          ? sample.rightAnkleY
-          : alpha * sample.rightAnkleY + (1 - alpha) * rightPrev;
-    const nextHip =
-      sample.hipY === null
-        ? null
-        : hipPrev === null
-          ? sample.hipY
-          : alpha * sample.hipY + (1 - alpha) * hipPrev;
-    const nextTorso =
-      sample.torso === null
-        ? null
-        : torsoPrev === null
-          ? sample.torso
-          : alpha * sample.torso + (1 - alpha) * torsoPrev;
-    const nextCenter =
-      sample.centerX === null
-        ? null
-        : centerPrev === null
-          ? sample.centerX
-          : alpha * sample.centerX + (1 - alpha) * centerPrev;
+    const nextLeftToe = emaStep(sample.leftToeY, leftToePrev, alpha);
+    const nextRightToe = emaStep(sample.rightToeY, rightToePrev, alpha);
+    const nextLeftHeel = emaStep(sample.leftHeelY, leftHeelPrev, alpha);
+    const nextRightHeel = emaStep(sample.rightHeelY, rightHeelPrev, alpha);
+    const nextLeft = emaStep(sample.leftAnkleY, leftPrev, alpha);
+    const nextRight = emaStep(sample.rightAnkleY, rightPrev, alpha);
+    const nextHip = emaStep(sample.hipY, hipPrev, alpha);
+    const nextTorso = emaStep(sample.torso, torsoPrev, alpha);
+    const nextCenter = emaStep(sample.centerX, centerPrev, alpha);
 
+    leftToePrev = nextLeftToe;
+    rightToePrev = nextRightToe;
+    leftHeelPrev = nextLeftHeel;
+    rightHeelPrev = nextRightHeel;
     leftPrev = nextLeft;
     rightPrev = nextRight;
     hipPrev = nextHip;
@@ -187,6 +229,10 @@ function applyEma(samples: FrameSignals[], alpha = 0.58): FrameSignals[] {
 
     return {
       ...sample,
+      leftToeY: nextLeftToe,
+      rightToeY: nextRightToe,
+      leftHeelY: nextLeftHeel,
+      rightHeelY: nextRightHeel,
       leftAnkleY: nextLeft,
       rightAnkleY: nextRight,
       hipY: nextHip,
@@ -197,36 +243,88 @@ function applyEma(samples: FrameSignals[], alpha = 0.58): FrameSignals[] {
 }
 
 function toSignals(frame: JumpLandmarkFrame, minConfidence: number): FrameSignals {
+  const footConfidence = Math.max(0.12, minConfidence - 0.08);
   const ankleConfidence = Math.max(0.16, minConfidence - 0.04);
+  const faceConfidence = Math.max(0.18, minConfidence - 0.06);
+  const nose = pointOrNull(frame, KP.NOSE, faceConfidence);
+  const le = pointOrNull(frame, KP.LEFT_EYE, faceConfidence);
+  const re = pointOrNull(frame, KP.RIGHT_EYE, faceConfidence);
+  const lEar = pointOrNull(frame, KP.LEFT_EAR, faceConfidence);
+  const rEar = pointOrNull(frame, KP.RIGHT_EAR, faceConfidence);
   const ls = pointOrNull(frame, KP.LEFT_SHOULDER, minConfidence);
   const rs = pointOrNull(frame, KP.RIGHT_SHOULDER, minConfidence);
   const lh = pointOrNull(frame, KP.LEFT_HIP, minConfidence);
   const rh = pointOrNull(frame, KP.RIGHT_HIP, minConfidence);
+  const lk = pointOrNull(frame, KP.LEFT_KNEE, minConfidence);
+  const rk = pointOrNull(frame, KP.RIGHT_KNEE, minConfidence);
   const la = pointOrNull(frame, KP.LEFT_ANKLE, ankleConfidence);
   const ra = pointOrNull(frame, KP.RIGHT_ANKLE, ankleConfidence);
+  const lHeel = pointOrNull(frame, KP.LEFT_HEEL, footConfidence);
+  const rHeel = pointOrNull(frame, KP.RIGHT_HEEL, footConfidence);
+  const lfi = pointOrNull(frame, KP.LEFT_FOOT_INDEX, footConfidence);
+  const rfi = pointOrNull(frame, KP.RIGHT_FOOT_INDEX, footConfidence);
 
   const shoulderY = midpointY(ls, rs);
   const hipY = midpointY(lh, rh);
   const torso =
     shoulderY !== null && hipY !== null ? Math.max(0.001, hipY - shoulderY) : null;
-  const centerX = midpointX(midpointPoint(ls, rs), midpointPoint(lh, rh));
+  const upperCenter = midpointPoint(ls, rs);
+  const lowerCenter = midpointPoint(lh, rh);
+  const ankleCenter = midpointPoint(
+    la ? { x: la.x, y: la.y } : null,
+    ra ? { x: ra.x, y: ra.y } : null,
+  );
+  const centerX = midpointX(
+    upperCenter ?? lowerCenter ?? ankleCenter,
+    lowerCenter ?? ankleCenter ?? upperCenter,
+  );
+  const faceVisible = [nose, le, re, lEar, rEar].some((point) => point !== null);
+  const leftToeY = lfi?.y ?? null;
+  const rightToeY = rfi?.y ?? null;
+  const leftHeelY = lHeel?.y ?? null;
+  const rightHeelY = rHeel?.y ?? null;
+  const leftKneeY = lk?.y ?? null;
+  const rightKneeY = rk?.y ?? null;
   const leftAnkleY = la?.y ?? null;
   const rightAnkleY = ra?.y ?? null;
-  const feetVisible = leftAnkleY !== null || rightAnkleY !== null;
+  // Feet visible if at least one toe or ankle is tracked.
+  const feetVisible =
+    leftToeY !== null || rightToeY !== null ||
+    leftHeelY !== null || rightHeelY !== null ||
+    leftAnkleY !== null || rightAnkleY !== null;
+  const bestFootY = Math.max(
+    leftToeY ?? 0,
+    rightToeY ?? 0,
+    leftHeelY ?? 0,
+    rightHeelY ?? 0,
+    leftAnkleY ?? 0,
+    rightAnkleY ?? 0,
+  );
   const fullBodyVisible =
+    faceVisible &&
     shoulderY !== null &&
     hipY !== null &&
+    leftKneeY !== null &&
+    rightKneeY !== null &&
     feetVisible &&
     shoulderY > 0.02 &&
-    Math.max(leftAnkleY ?? 0, rightAnkleY ?? 0) < 0.995;
+    bestFootY < 0.995;
 
   return {
     frameIndex: frame.frameIndex,
     timestampMs: frame.timestampMs,
+    captureTimestampMs: frame.captureTimestampMs ?? frame.timestampMs,
     avgConfidence: frame.avgConfidence,
     personCount: frame.personCount ?? 1,
+    faceVisible,
     fullBodyVisible,
     feetVisible,
+    leftToeY,
+    rightToeY,
+    leftHeelY,
+    rightHeelY,
+    leftKneeY,
+    rightKneeY,
     leftAnkleY,
     rightAnkleY,
     hipY,
@@ -246,54 +344,123 @@ function midpointPoint(
   return null;
 }
 
-function buildBaseline(samples: FrameSignals[]): Baseline | null {
-  const calibrationFrames = samples.filter(
-    (sample) =>
-      sample.timestampMs <= CALIBRATION_WINDOW_MS &&
-      sample.fullBodyVisible &&
-      sample.feetVisible &&
-      sample.torso !== null &&
-      sample.hipY !== null,
-  );
+function collectCalibrationFrames(window: FrameSignals[]): FrameSignals[] {
+  return window.filter((sample) => sample.fullBodyVisible);
+}
 
-  if (calibrationFrames.length < 6) return null;
+function buildBaselineFromCandidate(candidate: CalibrationCandidate): Baseline | null {
+  const calibrationFrames = candidate.frames;
 
-  const torsoValues = calibrationFrames.map((sample) => sample.torso!);
-  const leftValues = calibrationFrames.map(
-    (sample) => sample.leftAnkleY ?? sample.rightAnkleY!,
-  );
-  const rightValues = calibrationFrames.map(
-    (sample) => sample.rightAnkleY ?? sample.leftAnkleY!,
-  );
-  const hipValues = calibrationFrames.map((sample) => sample.hipY!);
+  const leftToeValues = calibrationFrames
+    .map((s) => s.leftToeY)
+    .filter((v): v is number => v !== null);
+  const rightToeValues = calibrationFrames
+    .map((s) => s.rightToeY)
+    .filter((v): v is number => v !== null);
+  const leftGroundValues = calibrationFrames
+    .map((s) => bestFootGroundY(s.leftToeY, s.leftHeelY, s.leftAnkleY))
+    .filter((v): v is number => v !== null);
+  const rightGroundValues = calibrationFrames
+    .map((s) => bestFootGroundY(s.rightToeY, s.rightHeelY, s.rightAnkleY))
+    .filter((v): v is number => v !== null);
+  const leftAnkleValues = calibrationFrames
+    .map((s) => s.leftAnkleY ?? s.rightAnkleY)
+    .filter((v): v is number => v !== null);
+  const rightAnkleValues = calibrationFrames
+    .map((s) => s.rightAnkleY ?? s.leftAnkleY)
+    .filter((v): v is number => v !== null);
+  const hipValues = calibrationFrames
+    .map((sample) => sample.hipY)
+    .filter((value): value is number => value !== null);
+  const torsoValues = calibrationFrames
+    .map((sample) => sample.torso)
+    .filter((value): value is number => value !== null);
   const centerValues = calibrationFrames
     .map((sample) => sample.centerX)
     .filter((value): value is number => value !== null);
 
-  if (centerValues.length < 6) return null;
-
-  const torso = median(torsoValues);
-  const averageAnkleSeries = calibrationFrames.map((sample) => {
-    const left = sample.leftAnkleY ?? sample.rightAnkleY!;
-    const right = sample.rightAnkleY ?? sample.leftAnkleY!;
-    return (left + right) / 2;
-  });
-  const stability = stdDev(averageAnkleSeries) / Math.max(0.001, torso);
-  const centerRange = Math.max(...centerValues) - Math.min(...centerValues);
-
-  if (stability > MAX_CALIBRATION_NOISE || centerRange > MAX_CALIBRATION_CENTER_RANGE) {
+  if (
+    leftGroundValues.length + rightGroundValues.length < 6 ||
+    hipValues.length < 6 ||
+    torsoValues.length < 6
+  ) {
     return null;
   }
 
+  const torso = median(torsoValues);
+
+  const bestFootSeries = calibrationFrames.map((s) => {
+    const left = bestFootGroundY(s.leftToeY, s.leftHeelY, s.leftAnkleY);
+    const right = bestFootGroundY(s.rightToeY, s.rightHeelY, s.rightAnkleY);
+    if (left === null || right === null) return null;
+    return (left + right) / 2;
+  }).filter((v): v is number => v !== null);
+  const stability = bestFootSeries.length > 0
+    ? stdDev(bestFootSeries) / Math.max(0.001, torso)
+    : 1;
+
+  if (centerValues.length >= 6) {
+    const centerRange = Math.max(...centerValues) - Math.min(...centerValues);
+    if (centerRange > MAX_CALIBRATION_CENTER_RANGE) {
+      return null;
+    }
+  }
+
+  if (stability > MAX_CALIBRATION_NOISE) {
+    return null;
+  }
+
+  const leftToeBaseline = leftToeValues.length > 0 ? median(leftToeValues) : median(leftGroundValues);
+  const rightToeBaseline = rightToeValues.length > 0 ? median(rightToeValues) : median(rightGroundValues);
+  const leftGroundBaseline = median(leftGroundValues);
+  const rightGroundBaseline = median(rightGroundValues);
+
   return {
-    leftAnkleY: median(leftValues),
-    rightAnkleY: median(rightValues),
+    leftToeY: leftToeBaseline,
+    rightToeY: rightToeBaseline,
+    leftGroundY: leftGroundBaseline,
+    rightGroundY: rightGroundBaseline,
+    leftAnkleY: leftAnkleValues.length > 0 ? median(leftAnkleValues) : leftToeBaseline,
+    rightAnkleY: rightAnkleValues.length > 0 ? median(rightAnkleValues) : rightToeBaseline,
     hipY: median(hipValues),
     torso,
-    centerX: median(centerValues),
-    calibrationEndMs: CALIBRATION_WINDOW_MS,
+    centerX: centerValues.length > 0 ? median(centerValues) : 0.5,
+    calibrationEndMs: candidate.endMs,
     stability,
   };
+}
+
+function buildBaseline(samples: FrameSignals[]): Baseline | null {
+  if (samples.length === 0) return null;
+
+  for (let startIndex = 0; startIndex < samples.length; startIndex += 1) {
+    const startSample = samples[startIndex];
+    if (!startSample.fullBodyVisible) {
+      continue;
+    }
+    const windowEndLimit = startSample.timestampMs + CALIBRATION_WINDOW_MS;
+    const window = samples.filter(
+      (sample) =>
+        sample.timestampMs >= startSample.timestampMs &&
+        sample.timestampMs <= windowEndLimit,
+    );
+    const calibrationFrames = collectCalibrationFrames(window);
+    const endSample = last(calibrationFrames);
+    if (calibrationFrames.length < 6 || !endSample) {
+      continue;
+    }
+
+    const baseline = buildBaselineFromCandidate({
+      frames: calibrationFrames,
+      endMs: endSample.timestampMs,
+    });
+
+    if (baseline) {
+      return baseline;
+    }
+  }
+
+  return null;
 }
 
 function emptyDebug(
@@ -301,8 +468,12 @@ function emptyDebug(
   videoDurationMs: number,
   videoFps: number,
   sampleFps: number,
+  playbackVideoFps?: number,
+  playbackSampleFps?: number,
 ): JumpAnalysisDebug {
   const baseline: JumpBaselineDebug = {
+    leftToeY: 0,
+    rightToeY: 0,
     leftAnkleY: 0,
     rightAnkleY: 0,
     hipY: 0,
@@ -317,6 +488,10 @@ function emptyDebug(
     videoDurationMs,
     videoFps,
     sampleFps,
+    playbackVideoFps,
+    playbackSampleFps,
+    slowMotionScaleFactor:
+      playbackVideoFps && videoFps && videoFps > 0 ? playbackVideoFps / videoFps : undefined,
     averageConfidence: 0,
     uncertaintyRatio: 1,
     fullBodyVisibleRatio: 0,
@@ -333,7 +508,7 @@ function invalidSummary(reason: JumpInvalidReason): string {
     case 'MULTIPLE_PEOPLE':
       return 'More than one person was visible, so the jump was rejected.';
     case 'BODY_NOT_FULLY_VISIBLE':
-      return 'The full body was not visible for enough of the clip.';
+      return 'Keep the face, torso, hips, and both feet visible for the entire jump.';
     case 'FEET_NOT_VISIBLE':
       return 'Feet were not visible clearly enough to time takeoff and landing.';
     case 'NO_STABLE_CALIBRATION':
@@ -370,7 +545,7 @@ function scoreQuality(
 
   if (confidenceScore < 0.35) flags.push('LOW_CONFIDENCE');
   if (uncertaintyRatio > 0.12) flags.push('UNCERTAIN_TRACKING');
-  if (visibilityRatio < 0.75) flags.push('PARTIAL_BODY_VISIBILITY');
+  if (visibilityRatio < 0.75) flags.push('PARTIAL_FEET_VISIBILITY');
   if (fpsScore < 0.75) flags.push('LOW_SAMPLE_FPS');
   if (calibrationStability > 0.018) flags.push('CALIBRATION_NOISE');
 
@@ -387,6 +562,8 @@ function buildResult(
   invalidReason?: JumpInvalidReason,
   takeoffMs: number | null = null,
   landingMs: number | null = null,
+  takeoffPhysicalMs: number | null = null,
+  landingPhysicalMs: number | null = null,
   flightMs: number | null = null,
   heightCm: number | null = null,
   summary?: string,
@@ -394,6 +571,8 @@ function buildResult(
   return {
     takeoffMs,
     landingMs,
+    takeoffPhysicalMs,
+    landingPhysicalMs,
     flightMs,
     heightCm,
     phaseTimeline,
@@ -404,7 +583,7 @@ function buildResult(
       summary ??
       (invalidReason
         ? invalidSummary(invalidReason)
-        : `Takeoff at ${takeoffMs?.toFixed(1)} ms, landing at ${landingMs?.toFixed(1)} ms.`),
+        : `Takeoff at ${takeoffMs?.toFixed(1)} ms playback, landing at ${landingMs?.toFixed(1)} ms playback.`),
     debug,
   };
 }
@@ -422,7 +601,14 @@ export function analyzeJumpLandmarks(
     Math.max(0, ...frames.map((frame) => frame.timestampMs), 0);
   const videoFps = options.videoFps ?? options.sampleFps ?? 60;
   const sampleFps = options.sampleFps ?? options.videoFps ?? 60;
-  const debugBase = emptyDebug(frames.length, videoDurationMs, videoFps, sampleFps);
+  const debugBase = emptyDebug(
+    frames.length,
+    videoDurationMs,
+    videoFps,
+    sampleFps,
+    options.playbackVideoFps,
+    options.playbackSampleFps,
+  );
 
   if (frames.length === 0) {
     return buildResult(debugBase, [], 'LOW', ['NO_ANALYZED_FRAMES'], 'NO_PERSON');
@@ -462,7 +648,7 @@ export function analyzeJumpLandmarks(
     );
   }
 
-  if (fullBodyVisibleRatio < 0.4) {
+  if (fullBodyVisibleRatio < MIN_FULL_BODY_VISIBLE_RATIO) {
     return buildResult(
       {
         ...debugBase,
@@ -472,7 +658,7 @@ export function analyzeJumpLandmarks(
       },
       [],
       'LOW',
-      ['INSUFFICIENT_BODY_VISIBILITY'],
+      ['INSUFFICIENT_FULL_BODY_VISIBILITY'],
       'BODY_NOT_FULLY_VISIBLE',
     );
   }
@@ -509,13 +695,22 @@ export function analyzeJumpLandmarks(
   }
 
   let takeoffCandidateStart: number | null = null;
+  let takeoffCandidateStartCaptureMs: number | null = null;
   let landingCandidateStart: number | null = null;
+  let landingCandidateStartCaptureMs: number | null = null;
   let takeoffConfirm = 0;
   let landingConfirm = 0;
   let takeoffMs: number | null = null;
   let landingMs: number | null = null;
+  let takeoffCaptureMs: number | null = null;
+  let landingCaptureMs: number | null = null;
+  let lastGroundContactMs: number | null = null;
+  let lastGroundContactCaptureMs: number | null = null;
+  let takeoffCandidateLastContactMs: number | null = null;
+  let takeoffCandidateLastContactCaptureMs: number | null = null;
   let airborne = false;
   let uncertainFrames = 0;
+  let trackingGap = 0;
   let maxHorizontalDrift = 0;
 
   const phaseTimeline: JumpPhaseSample[] = [];
@@ -528,15 +723,20 @@ export function analyzeJumpLandmarks(
       maxHorizontalDrift = Math.max(maxHorizontalDrift, horizontalDrift);
     }
 
+    const leftFootY = bestFootGroundY(signal.leftToeY, signal.leftHeelY, signal.leftAnkleY);
+    const rightFootY = bestFootGroundY(signal.rightToeY, signal.rightHeelY, signal.rightAnkleY);
+    const leftFootBaseline = baseline.leftGroundY;
+    const rightFootBaseline = baseline.rightGroundY;
+
     const leftLift =
-      signal.leftAnkleY === null ? null : (baseline.leftAnkleY - signal.leftAnkleY) / torsoScale;
+      leftFootY === null ? null : (leftFootBaseline - leftFootY) / torsoScale;
     const rightLift =
-      signal.rightAnkleY === null ? null : (baseline.rightAnkleY - signal.rightAnkleY) / torsoScale;
+      rightFootY === null ? null : (rightFootBaseline - rightFootY) / torsoScale;
     const hipLift =
       signal.hipY === null ? null : (baseline.hipY - signal.hipY) / torsoScale;
 
     let phase: JumpContactPhase = 'UNCERTAIN';
-    const bothLifted =
+    const bothAirborne =
       leftLift !== null &&
       rightLift !== null &&
       leftLift > TAKEOFF_THRESHOLD &&
@@ -545,41 +745,83 @@ export function analyzeJumpLandmarks(
       (leftLift !== null && leftLift <= LANDING_THRESHOLD) ||
       (rightLift !== null && rightLift <= LANDING_THRESHOLD);
 
-    if (!signal.fullBodyVisible || !signal.feetVisible || signal.torso === null) {
+    if (!signal.feetVisible) {
       uncertainFrames += 1;
+      trackingGap += 1;
       if (!airborne) {
-        takeoffConfirm = 0;
-        takeoffCandidateStart = null;
+        if (takeoffConfirm > 0 && trackingGap <= MAX_TAKEOFF_GAP_FRAMES) {
+          takeoffConfirm += 1;
+          if (takeoffConfirm >= TAKEOFF_CONFIRM_FRAMES) {
+            takeoffMs = takeoffCandidateLastContactMs ?? takeoffCandidateStart;
+            takeoffCaptureMs =
+              takeoffCandidateLastContactCaptureMs ?? takeoffCandidateStartCaptureMs;
+            airborne = true;
+          }
+        } else if (trackingGap > MAX_TAKEOFF_GAP_FRAMES) {
+          takeoffConfirm = 0;
+          takeoffCandidateStart = null;
+          takeoffCandidateStartCaptureMs = null;
+          takeoffCandidateLastContactMs = null;
+          takeoffCandidateLastContactCaptureMs = null;
+        }
       }
       landingConfirm = 0;
       landingCandidateStart = null;
+      landingCandidateStartCaptureMs = null;
       phase = 'UNCERTAIN';
-    } else if (!airborne) {
-      phase = bothLifted ? 'AIRBORNE' : 'GROUND_CONTACT';
-      if (signal.timestampMs >= baseline.calibrationEndMs && bothLifted) {
-        takeoffCandidateStart ??= signal.timestampMs;
-        takeoffConfirm += 1;
-        if (takeoffConfirm >= TAKEOFF_CONFIRM_FRAMES) {
-          takeoffMs = takeoffCandidateStart;
-          airborne = true;
-        }
-      } else {
-        takeoffConfirm = 0;
-        takeoffCandidateStart = null;
-      }
     } else {
-      if (oneFootGrounded) {
-        phase = 'GROUND_CONTACT';
-        landingCandidateStart ??= signal.timestampMs;
-        landingConfirm += 1;
-        if (landingConfirm >= LANDING_CONFIRM_FRAMES && landingMs === null) {
-          landingMs = landingCandidateStart;
-          airborne = false;
+      trackingGap = 0;
+      if (!airborne) {
+        phase = bothAirborne ? 'AIRBORNE' : oneFootGrounded ? 'GROUND_CONTACT' : 'UNCERTAIN';
+        if (signal.timestampMs >= baseline.calibrationEndMs && bothAirborne) {
+          takeoffCandidateStart ??= signal.timestampMs;
+          takeoffCandidateStartCaptureMs ??= signal.captureTimestampMs;
+          takeoffCandidateLastContactMs ??= lastGroundContactMs ?? signal.timestampMs;
+          takeoffCandidateLastContactCaptureMs ??=
+            lastGroundContactCaptureMs ?? signal.captureTimestampMs;
+          takeoffConfirm += 1;
+          if (takeoffConfirm >= TAKEOFF_CONFIRM_FRAMES) {
+            takeoffMs = takeoffCandidateLastContactMs ?? takeoffCandidateStart;
+            takeoffCaptureMs =
+              takeoffCandidateLastContactCaptureMs ?? takeoffCandidateStartCaptureMs;
+            airborne = true;
+          }
+        } else if (phase === 'GROUND_CONTACT') {
+          lastGroundContactMs = signal.timestampMs;
+          lastGroundContactCaptureMs = signal.captureTimestampMs;
+          takeoffConfirm = 0;
+          takeoffCandidateStart = null;
+          takeoffCandidateStartCaptureMs = null;
+          takeoffCandidateLastContactMs = null;
+          takeoffCandidateLastContactCaptureMs = null;
+        } else {
+          uncertainFrames += 1;
+          takeoffConfirm = 0;
+          takeoffCandidateStart = null;
+          takeoffCandidateStartCaptureMs = null;
+          takeoffCandidateLastContactMs = null;
+          takeoffCandidateLastContactCaptureMs = null;
         }
       } else {
-        phase = bothLifted ? 'AIRBORNE' : 'UNCERTAIN';
-        landingConfirm = 0;
-        landingCandidateStart = null;
+        if (oneFootGrounded) {
+          phase = 'GROUND_CONTACT';
+          landingCandidateStart ??= signal.timestampMs;
+          landingCandidateStartCaptureMs ??= signal.captureTimestampMs;
+          landingConfirm += 1;
+          if (landingConfirm >= LANDING_CONFIRM_FRAMES && landingMs === null) {
+            landingMs = landingCandidateStart;
+            landingCaptureMs = landingCandidateStartCaptureMs;
+            airborne = false;
+          }
+        } else {
+          phase = bothAirborne ? 'AIRBORNE' : 'UNCERTAIN';
+          if (phase === 'UNCERTAIN') {
+            uncertainFrames += 1;
+          }
+          landingConfirm = 0;
+          landingCandidateStart = null;
+          landingCandidateStartCaptureMs = null;
+        }
       }
     }
 
@@ -596,10 +838,14 @@ export function analyzeJumpLandmarks(
 
   const uncertaintyRatio = phaseTimeline.length > 0 ? uncertainFrames / phaseTimeline.length : 1;
   const qualityFlags = [...preFlags];
+  const visibilityRatio = Math.min(fullBodyVisibleRatio, feetVisibleRatio);
+  if (fullBodyVisibleRatio < 0.8) {
+    qualityFlags.push('PARTIAL_FULL_BODY_VISIBILITY');
+  }
   const quality = scoreQuality(
     averageConfidence,
     uncertaintyRatio,
-    Math.min(fullBodyVisibleRatio, feetVisibleRatio),
+    visibilityRatio,
     fpsScore,
     baseline.stability,
     qualityFlags,
@@ -612,6 +858,12 @@ export function analyzeJumpLandmarks(
     videoDurationMs,
     videoFps,
     sampleFps,
+    playbackVideoFps: options.playbackVideoFps,
+    playbackSampleFps: options.playbackSampleFps,
+    slowMotionScaleFactor:
+      options.playbackVideoFps && videoFps > 0
+        ? options.playbackVideoFps / videoFps
+        : undefined,
     averageConfidence,
     uncertaintyRatio,
     fullBodyVisibleRatio,
@@ -638,7 +890,9 @@ export function analyzeJumpLandmarks(
     return buildResult(debug, phaseTimeline, quality, qualityFlags, 'NO_LANDING', takeoffMs);
   }
 
-  const flightMs = landingMs - takeoffMs;
+  const physicalTakeoffMs = takeoffCaptureMs ?? takeoffMs;
+  const physicalLandingMs = landingCaptureMs ?? landingMs;
+  const flightMs = physicalLandingMs - physicalTakeoffMs;
   if (flightMs < MIN_FLIGHT_MS || flightMs > MAX_FLIGHT_MS) {
     return buildResult(
       debug,
@@ -648,6 +902,8 @@ export function analyzeJumpLandmarks(
       'AIRTIME_OUT_OF_RANGE',
       takeoffMs,
       landingMs,
+      physicalTakeoffMs,
+      physicalLandingMs,
       flightMs,
     );
   }
@@ -661,6 +917,8 @@ export function analyzeJumpLandmarks(
     undefined,
     takeoffMs,
     landingMs,
+    physicalTakeoffMs,
+    physicalLandingMs,
     flightMs,
     heightCm,
     `Flight time ${flightMs.toFixed(1)} ms produced ${heightCm.toFixed(1)} cm.`,

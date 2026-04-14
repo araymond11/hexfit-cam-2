@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform } from 'react-native';
-import { useRunOnJS } from 'react-native-worklets-core';
-import { runAsync, runAtTargetFps, useFrameProcessor } from 'react-native-vision-camera';
+import type { Keypoint } from '@tensorflow-models/pose-detection';
+import * as poseDetection from '@tensorflow-models/pose-detection';
 import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-react-native';
-import * as poseDetection from '@tensorflow-models/pose-detection';
-import type { Keypoint } from '@tensorflow-models/pose-detection';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
+import { runAsync, runAtTargetFps, useFrameProcessor } from 'react-native-vision-camera';
+import { useRunOnJS } from 'react-native-worklets-core';
 
 import { type JumpResult } from '@/utils/jumpCalc';
 import { KP, MIN_CONFIDENCE } from '@/utils/poseUtils';
@@ -46,7 +46,7 @@ const INVALID_SETUP_FRAMES = 4;
 const RECOVER_SETUP_FRAMES = 10;
 const MAX_TRACKING_LOSS_MS = 550;
 
-const GRAVITY_M_S2 = 9.8066;
+const GRAVITY_M_S2 = 9.81;
 
 type InternalStatus = 'IDLE' | 'CALIBRATING' | 'READY' | 'AIRBORNE' | 'LANDED' | 'INVALID_SETUP';
 

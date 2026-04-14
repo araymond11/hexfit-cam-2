@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Platform } from 'react-native';
-import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
 import { runAsync, runAtTargetFps, useFrameProcessor } from 'react-native-vision-camera';
+import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
 
 import { type JumpResult } from '@/utils/jumpCalc';
 
@@ -29,7 +29,7 @@ const READY_ARM_CONTACT_MIN = 0.64;
 const READY_ARM_LIFT_MAX = 0.26;
 const READY_ARM_ACTIVE_WINDOW_MS = 1400;
 const READY_INVALID_SETUP_FRAMES = 10;
-const GRAVITY_M_S2 = 9.8066;
+const GRAVITY_M_S2 = 9.81;
 
 type Region = {
   x0: number;

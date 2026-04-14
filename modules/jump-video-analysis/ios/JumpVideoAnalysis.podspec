@@ -11,13 +11,14 @@ Pod::Spec.new do |s|
   s.author         = 'OpenAI'
   s.homepage       = 'https://example.invalid/jump-video-analysis'
   s.platforms      = {
-    :ios => '15.1'
+    :ios => '15.5'
   }
   s.source         = { :git => 'https://example.invalid/jump-video-analysis.git' }
   s.static_framework = true
   s.swift_version  = '5.9'
 
   s.dependency 'ExpoModulesCore'
-  s.frameworks = ['AVFoundation', 'Vision', 'ImageIO']
+  s.dependency 'GoogleMLKit/PoseDetectionAccurate', '~> 8.0'
+  s.frameworks = ['AVFoundation', 'ImageIO']
   s.source_files = '**/*.{h,m,swift}'
 end

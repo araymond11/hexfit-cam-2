@@ -1,4 +1,4 @@
-export const GRAVITY_MS2 = 9.8066;
+export const GRAVITY_MS2 = 9.81;
 
 export type JumpPhase =
   | 'IDLE'
@@ -33,6 +33,7 @@ export interface JumpResult {
 
 export interface JumpClip {
   uri: string;
+  assetId?: string | null;
   fps: number;
   durationMs: number;
   width: number;
@@ -50,7 +51,29 @@ export interface JumpKeypoint {
 export interface JumpLandmarkFrame {
   frameIndex: number;
   timestampMs: number;
+  captureTimestampMs?: number;
   keypoints: JumpKeypoint[];
+  avgConfidence: number;
+  personCount?: number;
+}
+
+export interface JumpFootBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface JumpFootContactFrame {
+  frameIndex: number;
+  timestampMs: number;
+  leftFootBox: JumpFootBox | null;
+  rightFootBox: JumpFootBox | null;
+  leftFootBottomY: number | null;
+  rightFootBottomY: number | null;
+  leftContactScore: number | null;
+  rightContactScore: number | null;
+  floorY: number | null;
   avgConfidence: number;
   personCount?: number;
 }
@@ -65,10 +88,22 @@ export interface JumpVideoAnalysisOptions {
   sampleFps?: number;
   maxFrames?: number;
   minConfidence?: number;
+  analysisStartMs?: number;
+  analysisEndMs?: number;
 }
 
 export interface JumpVideoNativeResult {
   frames: JumpLandmarkFrame[];
+  videoFps: number;
+  sampleFps: number;
+  playbackVideoFps?: number;
+  playbackSampleFps?: number;
+  videoDurationMs: number;
+  personCountSummary: JumpPersonCountSummary;
+}
+
+export interface JumpFootVideoNativeResult {
+  frames: JumpFootContactFrame[];
   videoFps: number;
   sampleFps: number;
   videoDurationMs: number;
@@ -86,6 +121,8 @@ export interface JumpPhaseSample {
 }
 
 export interface JumpBaselineDebug {
+  leftToeY: number;
+  rightToeY: number;
   leftAnkleY: number;
   rightAnkleY: number;
   hipY: number;
@@ -100,6 +137,9 @@ export interface JumpAnalysisDebug {
   videoDurationMs: number;
   videoFps: number;
   sampleFps: number;
+  playbackVideoFps?: number;
+  playbackSampleFps?: number;
+  slowMotionScaleFactor?: number;
   averageConfidence: number;
   uncertaintyRatio: number;
   fullBodyVisibleRatio: number;
@@ -111,6 +151,8 @@ export interface JumpAnalysisDebug {
 export interface JumpAnalysisResult {
   takeoffMs: number | null;
   landingMs: number | null;
+  takeoffPhysicalMs: number | null;
+  landingPhysicalMs: number | null;
   flightMs: number | null;
   heightCm: number | null;
   phaseTimeline: JumpPhaseSample[];
@@ -119,6 +161,55 @@ export interface JumpAnalysisResult {
   qualityFlags?: string[];
   summary: string;
   debug: JumpAnalysisDebug;
+}
+
+export interface JumpFeetPhaseSample {
+  frameIndex: number;
+  timestampMs: number;
+  phase: JumpContactPhase;
+  leftLift: number | null;
+  rightLift: number | null;
+  leftContactScore: number | null;
+  rightContactScore: number | null;
+  horizontalDrift: number | null;
+}
+
+export interface JumpFeetBaselineDebug {
+  leftBottomY: number;
+  rightBottomY: number;
+  floorY: number;
+  leftFootHeight: number;
+  rightFootHeight: number;
+  centerX: number;
+}
+
+export interface JumpFeetAnalysisDebug {
+  calibrationEndMs: number;
+  baseline: JumpFeetBaselineDebug;
+  analyzedFrameCount: number;
+  videoDurationMs: number;
+  videoFps: number;
+  sampleFps: number;
+  averageConfidence: number;
+  uncertaintyRatio: number;
+  feetVisibleRatio: number;
+  dualFootVisibleRatio: number;
+  maxHorizontalDrift: number;
+  calibrationStability: number;
+  averageContactReliability: number;
+}
+
+export interface JumpFeetAnalysisResult {
+  takeoffMs: number | null;
+  landingMs: number | null;
+  flightMs: number | null;
+  heightCm: number | null;
+  phaseTimeline: JumpFeetPhaseSample[];
+  quality: JumpQuality;
+  invalidReason?: JumpInvalidReason;
+  qualityFlags?: string[];
+  summary: string;
+  debug: JumpFeetAnalysisDebug;
 }
 
 export interface CalibrationData {
