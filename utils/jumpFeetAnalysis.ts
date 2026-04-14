@@ -333,6 +333,10 @@ function invalidSummary(reason: JumpInvalidReason): string {
       return 'Le temps de vol detecte est hors plage attendue.';
     case 'EXCESS_HORIZONTAL_MOTION':
       return 'Trop de deplacement horizontal a ete detecte pour une mesure fiable.';
+    case 'TIMING_AMBIGUOUS':
+      return 'La base de temps de la video importee est ambigue.';
+    case 'EVENT_ORDER_INVALID':
+      return 'L ordre des evenements detectes est invalide.';
   }
 }
 

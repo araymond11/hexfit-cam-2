@@ -9,25 +9,34 @@ import {
   type JumpPersonCountSummary,
   type JumpPhaseSample,
   type JumpQuality,
+  type JumpTimingMode,
   heightFromFlightTime,
 } from './jumpCalc.ts';
 
 const MIN_CONFIDENCE = 0.2;
 const CALIBRATION_WINDOW_MS = 750;
-const TAKEOFF_THRESHOLD = 0.04;
-const LANDING_THRESHOLD = 0.02;
 const TAKEOFF_CONFIRM_FRAMES = 2;
 const LANDING_CONFIRM_FRAMES = 2;
+const ADAPTIVE_ONE_FRAME_MIN_FPS = 180;
+const ADAPTIVE_TAKEOFF_MIN_CONFIDENCE = 0.72;
+const ADAPTIVE_LANDING_MIN_CONFIDENCE = 0.7;
 const MIN_FULL_BODY_VISIBLE_RATIO = 0.6;
-/** Allow this many consecutive untracked frames without resetting takeoff
- *  confirmation.  Fast upward motion commonly causes brief tracking loss
- *  that should not invalidate the takeoff signal. */
 const MAX_TAKEOFF_GAP_FRAMES = 4;
 const MIN_FLIGHT_MS = 180;
 const MAX_FLIGHT_MS = 900;
 const MAX_CALIBRATION_CENTER_RANGE = 0.12;
 const MAX_ALLOWED_HORIZONTAL_DRIFT = 0.18;
 const MAX_CALIBRATION_NOISE = 0.025;
+const MAX_ATTEMPT_SEARCH_AFTER_CALIBRATION_MS = 6000;
+const ATTEMPT_WINDOW_PRE_ROLL_MS = 300;
+const ATTEMPT_WINDOW_POST_ROLL_MS = 800;
+const TOE_CONTACT_THRESHOLD = 0.012;
+const GROUND_CONTACT_THRESHOLD = 0.018;
+const TOE_FALLBACK_CONTACT_THRESHOLD = 0.016;
+const TOE_CLEAR_THRESHOLD = 0.028;
+const GROUND_CLEAR_THRESHOLD = 0.032;
+const HIP_CLEAR_THRESHOLD = 0.015;
+const MIN_FEET_VISIBLE_RATIO = 0.45;
 
 interface AnalysisOptions {
   videoDurationMs?: number;
@@ -35,6 +44,16 @@ interface AnalysisOptions {
   sampleFps?: number;
   playbackVideoFps?: number;
   playbackSampleFps?: number;
+  playbackDurationMs?: number;
+  captureDurationMs?: number;
+  timingMode?: JumpTimingMode;
+  timingConfidence?: number;
+  captureTimeScale?: number;
+  hasTimeSegments?: boolean;
+  usedOriginalAsset?: boolean;
+  usedPlaybackAsset?: boolean;
+  originalDurationMs?: number | null;
+  timebaseSource?: string;
   personCountSummary?: JumpPersonCountSummary;
   minConfidence?: number;
 }
@@ -47,7 +66,6 @@ interface FrameSignals {
   personCount: number;
   faceVisible: boolean;
   fullBodyVisible: boolean;
-  /** At least one toe (foot index) or ankle is visible. */
   feetVisible: boolean;
   leftToeY: number | null;
   rightToeY: number | null;
@@ -61,6 +79,14 @@ interface FrameSignals {
   shoulderY: number | null;
   torso: number | null;
   centerX: number | null;
+  /** Pixel-based floor band Y from native module. */
+  floorBandY: number | null;
+  /** Floor detection confidence from native module. */
+  floorConfidence: number;
+  /** Pixel-based contact score for the left foot from native module. */
+  nativeLeftContactScore: number | null;
+  /** Pixel-based contact score for the right foot from native module. */
+  nativeRightContactScore: number | null;
 }
 
 interface Baseline {
@@ -73,13 +99,61 @@ interface Baseline {
   hipY: number;
   torso: number;
   centerX: number;
+  calibrationStartMs: number;
   calibrationEndMs: number;
   stability: number;
 }
 
 interface CalibrationCandidate {
-  frames: FrameSignals[];
+  startIndex: number;
+  endIndex: number;
+  startMs: number;
   endMs: number;
+  frames: FrameSignals[];
+  baseline: Baseline;
+}
+
+type FootContactState = 'CONTACT' | 'CLEAR' | 'UNCERTAIN';
+
+interface FootContactInfo {
+  state: FootContactState;
+  contact: boolean | null;
+  confidence: number;
+  toeLift: number | null;
+  groundLift: number | null;
+}
+
+interface AttemptEvaluation {
+  baseline: Baseline;
+  takeoffMs: number | null;
+  landingMs: number | null;
+  takeoffCaptureMs: number | null;
+  landingCaptureMs: number | null;
+  phaseTimeline: JumpPhaseSample[];
+  invalidReason?: JumpInvalidReason;
+  maxHorizontalDrift: number;
+  uncertaintyRatio: number;
+  averageContactReliability: number;
+  fullBodyVisibleRatio: number;
+  feetVisibleRatio: number;
+  peakHipLift: number;
+  peakGroundClearance: number;
+  attemptWindowStartMs: number;
+  attemptWindowEndMs: number;
+  selectionScore: number;
+  /** Toe Y of the last contact frame before takeoff (landing baseline). */
+  takeoffLeftToeY: number | null;
+  takeoffRightToeY: number | null;
+}
+
+export interface JumpAttemptWindowSuggestion {
+  startMs: number;
+  endMs: number;
+  calibrationStartMs: number;
+  calibrationEndMs: number;
+  takeoffMs: number | null;
+  landingMs: number | null;
+  selectionScore: number;
 }
 
 function clamp01(value: number): number {
@@ -134,6 +208,16 @@ function midpointX(
   if (a && b) return (a.x + b.x) / 2;
   if (a) return a.x;
   if (b) return b.x;
+  return null;
+}
+
+function midpointPoint(
+  a: { x: number; y: number } | null,
+  b: { x: number; y: number } | null,
+): { x: number; y: number } | null {
+  if (a && b) return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  if (a) return a;
+  if (b) return b;
   return null;
 }
 
@@ -193,8 +277,6 @@ function emaStep(current: number | null, prev: number | null, alpha: number): nu
   return alpha * current + (1 - alpha) * prev;
 }
 
-// Keep EMA effectively pass-through in the timing path. A slower EMA reduces
-// jitter, but it also shifts touchdown later by one or more 240 fps frames.
 function applyEma(samples: FrameSignals[], alpha = 1): FrameSignals[] {
   let leftToePrev: number | null = null;
   let rightToePrev: number | null = null;
@@ -287,7 +369,6 @@ function toSignals(frame: JumpLandmarkFrame, minConfidence: number): FrameSignal
   const rightKneeY = rk?.y ?? null;
   const leftAnkleY = la?.y ?? null;
   const rightAnkleY = ra?.y ?? null;
-  // Feet visible if at least one toe or ankle is tracked.
   const feetVisible =
     leftToeY !== null || rightToeY !== null ||
     leftHeelY !== null || rightHeelY !== null ||
@@ -331,26 +412,22 @@ function toSignals(frame: JumpLandmarkFrame, minConfidence: number): FrameSignal
     shoulderY,
     torso,
     centerX,
+    floorBandY: typeof frame.floorBandY === 'number' ? frame.floorBandY : null,
+    floorConfidence: frame.floorConfidence ?? 0,
+    nativeLeftContactScore: typeof frame.leftContactScore === 'number' ? frame.leftContactScore : null,
+    nativeRightContactScore: typeof frame.rightContactScore === 'number' ? frame.rightContactScore : null,
   };
-}
-
-function midpointPoint(
-  a: { x: number; y: number } | null,
-  b: { x: number; y: number } | null,
-): { x: number; y: number } | null {
-  if (a && b) return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-  if (a) return a;
-  if (b) return b;
-  return null;
 }
 
 function collectCalibrationFrames(window: FrameSignals[]): FrameSignals[] {
   return window.filter((sample) => sample.fullBodyVisible);
 }
 
-function buildBaselineFromCandidate(candidate: CalibrationCandidate): Baseline | null {
-  const calibrationFrames = candidate.frames;
-
+function buildBaselineFromFrames(
+  calibrationFrames: FrameSignals[],
+  startMs: number,
+  endMs: number,
+): Baseline | null {
   const leftToeValues = calibrationFrames
     .map((s) => s.leftToeY)
     .filter((v): v is number => v !== null);
@@ -388,7 +465,6 @@ function buildBaselineFromCandidate(candidate: CalibrationCandidate): Baseline |
   }
 
   const torso = median(torsoValues);
-
   const bestFootSeries = calibrationFrames.map((s) => {
     const left = bestFootGroundY(s.leftToeY, s.leftHeelY, s.leftAnkleY);
     const right = bestFootGroundY(s.rightToeY, s.rightHeelY, s.rightAnkleY);
@@ -425,42 +501,64 @@ function buildBaselineFromCandidate(candidate: CalibrationCandidate): Baseline |
     hipY: median(hipValues),
     torso,
     centerX: centerValues.length > 0 ? median(centerValues) : 0.5,
-    calibrationEndMs: candidate.endMs,
+    calibrationStartMs: startMs,
+    calibrationEndMs: endMs,
     stability,
   };
 }
 
-function buildBaseline(samples: FrameSignals[]): Baseline | null {
-  if (samples.length === 0) return null;
+function collectCalibrationCandidates(samples: FrameSignals[]): CalibrationCandidate[] {
+  const candidates: CalibrationCandidate[] = [];
 
   for (let startIndex = 0; startIndex < samples.length; startIndex += 1) {
     const startSample = samples[startIndex];
     if (!startSample.fullBodyVisible) {
       continue;
     }
+
     const windowEndLimit = startSample.timestampMs + CALIBRATION_WINDOW_MS;
-    const window = samples.filter(
-      (sample) =>
-        sample.timestampMs >= startSample.timestampMs &&
-        sample.timestampMs <= windowEndLimit,
-    );
+    const window: FrameSignals[] = [];
+    let candidateEndIndex = startIndex;
+
+    for (let index = startIndex; index < samples.length; index += 1) {
+      const sample = samples[index];
+      if (sample.timestampMs > windowEndLimit) {
+        break;
+      }
+      window.push(sample);
+      if (sample.fullBodyVisible) {
+        candidateEndIndex = index;
+      }
+    }
+
     const calibrationFrames = collectCalibrationFrames(window);
     const endSample = last(calibrationFrames);
     if (calibrationFrames.length < 6 || !endSample) {
       continue;
     }
 
-    const baseline = buildBaselineFromCandidate({
-      frames: calibrationFrames,
+    const baseline = buildBaselineFromFrames(
+      calibrationFrames,
+      calibrationFrames[0].timestampMs,
+      endSample.timestampMs,
+    );
+    if (!baseline) {
+      continue;
+    }
+
+    candidates.push({
+      startIndex,
+      endIndex: candidateEndIndex,
+      startMs: calibrationFrames[0].timestampMs,
       endMs: endSample.timestampMs,
+      frames: calibrationFrames,
+      baseline,
     });
 
-    if (baseline) {
-      return baseline;
-    }
+    startIndex = Math.max(startIndex, candidateEndIndex - 1);
   }
 
-  return null;
+  return candidates;
 }
 
 function emptyDebug(
@@ -470,6 +568,16 @@ function emptyDebug(
   sampleFps: number,
   playbackVideoFps?: number,
   playbackSampleFps?: number,
+  playbackDurationMs?: number,
+  captureDurationMs?: number,
+  timingMode?: JumpTimingMode,
+  timingConfidence?: number,
+  captureTimeScale?: number,
+  hasTimeSegments?: boolean,
+  usedOriginalAsset?: boolean,
+  usedPlaybackAsset?: boolean,
+  originalDurationMs?: number | null,
+  timebaseSource?: string,
 ): JumpAnalysisDebug {
   const baseline: JumpBaselineDebug = {
     leftToeY: 0,
@@ -490,8 +598,19 @@ function emptyDebug(
     sampleFps,
     playbackVideoFps,
     playbackSampleFps,
+    playbackDurationMs,
+    captureDurationMs,
     slowMotionScaleFactor:
       playbackVideoFps && videoFps && videoFps > 0 ? playbackVideoFps / videoFps : undefined,
+    timingMode,
+    timingConfidence,
+    timingTrusted: timingMode !== 'timing_ambiguous',
+    captureTimeScale,
+    hasTimeSegments,
+    usedOriginalAsset,
+    usedPlaybackAsset,
+    originalDurationMs,
+    timebaseSource,
     averageConfidence: 0,
     uncertaintyRatio: 1,
     fullBodyVisibleRatio: 0,
@@ -521,7 +640,15 @@ function invalidSummary(reason: JumpInvalidReason): string {
       return 'Airtime was outside the expected range for a valid vertical jump.';
     case 'EXCESS_HORIZONTAL_MOTION':
       return 'Too much horizontal motion was detected during the attempt.';
+    case 'TIMING_AMBIGUOUS':
+      return 'The imported video timebase was ambiguous, so physical airtime could not be trusted.';
+    case 'EVENT_ORDER_INVALID':
+      return 'Detected landing occurred before takeoff, so the event sequence was rejected.';
   }
+}
+
+function isTrustedTimingMode(timingMode: JumpTimingMode | undefined): boolean {
+  return timingMode !== 'timing_ambiguous';
 }
 
 function scoreQuality(
@@ -530,24 +657,28 @@ function scoreQuality(
   visibilityRatio: number,
   fpsScore: number,
   calibrationStability: number,
+  contactReliability: number,
   flags: string[],
 ): JumpQuality {
   const confidenceScore = clamp01((averageConfidence - 0.22) / 0.5);
   const uncertaintyScore = clamp01(1 - uncertaintyRatio / 0.25);
   const visibilityScore = clamp01((visibilityRatio - 0.55) / 0.4);
   const stabilityScore = clamp01(1 - calibrationStability / 0.03);
+  const contactScore = clamp01((contactReliability - 0.35) / 0.45);
   const total =
-    confidenceScore * 0.3 +
-    uncertaintyScore * 0.25 +
-    visibilityScore * 0.2 +
-    fpsScore * 0.15 +
-    stabilityScore * 0.1;
+    confidenceScore * 0.24 +
+    uncertaintyScore * 0.2 +
+    visibilityScore * 0.16 +
+    fpsScore * 0.12 +
+    stabilityScore * 0.1 +
+    contactScore * 0.18;
 
   if (confidenceScore < 0.35) flags.push('LOW_CONFIDENCE');
   if (uncertaintyRatio > 0.12) flags.push('UNCERTAIN_TRACKING');
   if (visibilityRatio < 0.75) flags.push('PARTIAL_FEET_VISIBILITY');
   if (fpsScore < 0.75) flags.push('LOW_SAMPLE_FPS');
   if (calibrationStability > 0.018) flags.push('CALIBRATION_NOISE');
+  if (contactReliability < 0.55) flags.push('WEAK_TOE_CONTACT_SIGNAL');
 
   if (total >= 0.72) return 'HIGH';
   if (total >= 0.45) return 'MEDIUM';
@@ -588,8 +719,590 @@ function buildResult(
   };
 }
 
+function classifyFootContact(
+  toeY: number | null,
+  heelY: number | null,
+  ankleY: number | null,
+  baselineToeY: number,
+  baselineGroundY: number,
+  torsoScale: number,
+  hipLift: number | null,
+  nativeContactScore: number | null = null,
+): FootContactInfo {
+  const footGroundY = bestFootGroundY(toeY, heelY, ankleY);
+  const toeLift = toeY === null ? null : (baselineToeY - toeY) / torsoScale;
+  const groundLift = footGroundY === null ? null : (baselineGroundY - footGroundY) / torsoScale;
+
+  const toeNearGround = toeLift !== null && toeLift <= TOE_CONTACT_THRESHOLD;
+  const groundNear = groundLift !== null && groundLift <= GROUND_CONTACT_THRESHOLD;
+  const toeNearFallback = toeLift !== null && toeLift <= TOE_FALLBACK_CONTACT_THRESHOLD;
+  const toeClear = toeLift !== null && toeLift >= TOE_CLEAR_THRESHOLD;
+  const groundClear = groundLift !== null && groundLift >= GROUND_CLEAR_THRESHOLD;
+  const hipClear = hipLift !== null && hipLift >= HIP_CLEAR_THRESHOLD;
+
+  // Native pixel-based score: >0.6 strongly suggests contact, <0.3 suggests clear
+  const hasNativeScore = nativeContactScore !== null && Number.isFinite(nativeContactScore);
+  const nativeSupportsContact = hasNativeScore && nativeContactScore! > 0.6;
+  const nativeSupportsClear = hasNativeScore && nativeContactScore! < 0.3;
+
+  // Geometric says CONTACT
+  if ((toeNearGround && (groundNear || groundLift === null)) || (groundNear && toeNearFallback)) {
+    const toeScore =
+      toeLift === null ? 0.45 : clamp01(1 - Math.max(0, toeLift) / Math.max(TOE_CONTACT_THRESHOLD, 0.001));
+    const groundScore =
+      groundLift === null
+        ? 0.55
+        : clamp01(1 - Math.max(0, groundLift) / Math.max(GROUND_CONTACT_THRESHOLD, 0.001));
+    let geoConfidence = Math.max(0.45, (toeScore * 0.65) + (groundScore * 0.35));
+
+    // Blend with native score: if native agrees, boost confidence; if disagrees, reduce
+    if (hasNativeScore) {
+      const nativeWeight = 0.35;
+      geoConfidence = geoConfidence * (1 - nativeWeight) + nativeContactScore! * nativeWeight;
+    }
+
+    return {
+      state: 'CONTACT',
+      contact: true,
+      confidence: geoConfidence,
+      toeLift,
+      groundLift,
+    };
+  }
+
+  if (toeY === null && groundNear) {
+    let conf = 0.42;
+    if (hasNativeScore) {
+      conf = conf * 0.65 + nativeContactScore! * 0.35;
+    }
+    return {
+      state: 'CONTACT',
+      contact: true,
+      confidence: conf,
+      toeLift,
+      groundLift,
+    };
+  }
+
+  // Native says CONTACT but geometry is ambiguous — promote to CONTACT
+  if (nativeSupportsContact && !toeClear && !groundClear) {
+    return {
+      state: 'CONTACT',
+      contact: true,
+      confidence: Math.max(0.4, nativeContactScore! * 0.6 + 0.2),
+      toeLift,
+      groundLift,
+    };
+  }
+
+  // Geometric says CLEAR
+  if ((toeClear && groundClear) || (groundClear && hipClear)) {
+    const toeScore =
+      toeLift === null
+        ? 0.35
+        : clamp01((toeLift - TOE_CONTACT_THRESHOLD) / Math.max(TOE_CLEAR_THRESHOLD - TOE_CONTACT_THRESHOLD, 0.001));
+    const groundScore =
+      groundLift === null
+        ? 0.35
+        : clamp01((groundLift - GROUND_CONTACT_THRESHOLD) / Math.max(GROUND_CLEAR_THRESHOLD - GROUND_CONTACT_THRESHOLD, 0.001));
+    let geoConfidence = Math.max(0.4, (toeScore * 0.6) + (groundScore * 0.4));
+
+    // Blend: if native also says clear, boost; if native says contact, reduce
+    if (hasNativeScore) {
+      const nativeWeight = 0.3;
+      const nativeClearScore = 1 - nativeContactScore!;
+      geoConfidence = geoConfidence * (1 - nativeWeight) + nativeClearScore * nativeWeight;
+    }
+
+    return {
+      state: 'CLEAR',
+      contact: false,
+      confidence: geoConfidence,
+      toeLift,
+      groundLift,
+    };
+  }
+
+  // Native says CLEAR but geometry is ambiguous — promote to CLEAR
+  if (nativeSupportsClear && hipClear) {
+    return {
+      state: 'CLEAR',
+      contact: false,
+      confidence: Math.max(0.38, (1 - nativeContactScore!) * 0.55 + 0.2),
+      toeLift,
+      groundLift,
+    };
+  }
+
+  return {
+    state: 'UNCERTAIN',
+    contact: null,
+    confidence: 0.2,
+    toeLift,
+    groundLift,
+  };
+}
+
+function requiredTakeoffConfirmFrames(
+  sampleFps: number,
+  leftContact: FootContactInfo,
+  rightContact: FootContactInfo,
+): number {
+  if (leftContact.contact !== false || rightContact.contact !== false) {
+    return TAKEOFF_CONFIRM_FRAMES;
+  }
+
+  return resolveAdaptiveConfirmFrames(
+    sampleFps,
+    Math.min(leftContact.confidence, rightContact.confidence),
+    ADAPTIVE_TAKEOFF_MIN_CONFIDENCE,
+    TAKEOFF_CONFIRM_FRAMES,
+  );
+}
+
+function requiredLandingConfirmFrames(
+  sampleFps: number,
+  leftContact: FootContactInfo,
+  rightContact: FootContactInfo,
+): number {
+  const strongestContactConfidence = Math.max(
+    leftContact.contact === true ? leftContact.confidence : 0,
+    rightContact.contact === true ? rightContact.confidence : 0,
+  );
+
+  return resolveAdaptiveConfirmFrames(
+    sampleFps,
+    strongestContactConfidence,
+    ADAPTIVE_LANDING_MIN_CONFIDENCE,
+    LANDING_CONFIRM_FRAMES,
+  );
+}
+
+export function resolveAdaptiveConfirmFrames(
+  sampleFps: number,
+  contactConfidence: number,
+  minConfidenceForOneFrame: number,
+  fallbackFrames: number,
+): number {
+  if (
+    sampleFps >= ADAPTIVE_ONE_FRAME_MIN_FPS &&
+    contactConfidence >= minConfidenceForOneFrame
+  ) {
+    return 1;
+  }
+
+  return fallbackFrames;
+}
+
+function selectionScoreForAttempt(
+  attempt: AttemptEvaluation,
+  averageConfidence: number,
+): number {
+  const validFlight =
+    attempt.takeoffCaptureMs !== null &&
+    attempt.landingCaptureMs !== null &&
+    attempt.landingCaptureMs - attempt.takeoffCaptureMs >= MIN_FLIGHT_MS &&
+    attempt.landingCaptureMs - attempt.takeoffCaptureMs <= MAX_FLIGHT_MS;
+
+  return (
+    (attempt.takeoffMs !== null ? 40 : 0) +
+    (attempt.landingMs !== null ? 40 : 0) +
+    (validFlight ? 50 : 0) +
+    attempt.peakHipLift * 120 +
+    attempt.peakGroundClearance * 150 +
+    attempt.averageContactReliability * 20 +
+    averageConfidence * 10 +
+    Math.min(attempt.fullBodyVisibleRatio, attempt.feetVisibleRatio) * 15 -
+    attempt.uncertaintyRatio * 25 -
+    attempt.maxHorizontalDrift * 35 -
+    (attempt.invalidReason ? 20 : 0)
+  );
+}
+
+function evaluateAttemptCandidate(
+  samples: FrameSignals[],
+  candidate: CalibrationCandidate,
+  averageConfidence: number,
+  sampleFps: number,
+): AttemptEvaluation {
+  const baseline = candidate.baseline;
+  const evaluationSignals = samples.filter(
+    (sample) =>
+      sample.timestampMs >= Math.max(0, baseline.calibrationStartMs - ATTEMPT_WINDOW_PRE_ROLL_MS) &&
+      sample.timestampMs <= baseline.calibrationEndMs + MAX_ATTEMPT_SEARCH_AFTER_CALIBRATION_MS,
+  );
+
+  let takeoffCandidateStart: number | null = null;
+  let takeoffCandidateStartCaptureMs: number | null = null;
+  let landingCandidateStart: number | null = null;
+  let landingCandidateStartCaptureMs: number | null = null;
+  let takeoffConfirm = 0;
+  let landingConfirm = 0;
+  let takeoffMs: number | null = null;
+  let landingMs: number | null = null;
+  let takeoffCaptureMs: number | null = null;
+  let landingCaptureMs: number | null = null;
+  let lastContactMs: number | null = null;
+  let lastContactCaptureMs: number | null = null;
+  // Track toe/ground Y of the last contact frame before takeoff.
+  // Used as the landing baseline to compensate for body drift during the jump.
+  let lastContactLeftToeY: number | null = null;
+  let lastContactRightToeY: number | null = null;
+  let lastContactLeftGroundY: number | null = null;
+  let lastContactRightGroundY: number | null = null;
+  let airborne = false;
+  let uncertainFrames = 0;
+  let visibleFrames = 0;
+  let feetVisibleFrames = 0;
+  let trackingGap = 0;
+  let maxHorizontalDrift = 0;
+  let contactConfidenceValues: number[] = [];
+  let peakHipLift = 0;
+  let peakGroundClearance = 0;
+  let stablePostLandingFrames = 0;
+
+  const torsoScale = Math.max(0.08, baseline.torso);
+  const phaseTimeline: JumpPhaseSample[] = [];
+
+  for (const signal of evaluationSignals) {
+    const horizontalDrift =
+      signal.centerX === null ? null : Math.abs(signal.centerX - baseline.centerX);
+    if (horizontalDrift !== null) {
+      maxHorizontalDrift = Math.max(maxHorizontalDrift, horizontalDrift);
+    }
+
+    if (signal.fullBodyVisible) visibleFrames += 1;
+    if (signal.feetVisible) feetVisibleFrames += 1;
+
+    const hipLift =
+      signal.hipY === null ? null : (baseline.hipY - signal.hipY) / torsoScale;
+    const leftContact = classifyFootContact(
+      signal.leftToeY,
+      signal.leftHeelY,
+      signal.leftAnkleY,
+      baseline.leftToeY,
+      baseline.leftGroundY,
+      torsoScale,
+      hipLift,
+      signal.nativeLeftContactScore,
+    );
+    const rightContact = classifyFootContact(
+      signal.rightToeY,
+      signal.rightHeelY,
+      signal.rightAnkleY,
+      baseline.rightToeY,
+      baseline.rightGroundY,
+      torsoScale,
+      hipLift,
+      signal.nativeRightContactScore,
+    );
+
+    const leftLift = leftContact.groundLift;
+    const rightLift = rightContact.groundLift;
+    const anyContact = leftContact.contact === true || rightContact.contact === true;
+    const bothClear = leftContact.contact === false && rightContact.contact === false;
+    let phase: JumpContactPhase = 'UNCERTAIN';
+
+    if (leftContact.contact !== null) contactConfidenceValues.push(leftContact.confidence);
+    if (rightContact.contact !== null) contactConfidenceValues.push(rightContact.confidence);
+    if (hipLift !== null) peakHipLift = Math.max(peakHipLift, hipLift);
+    if (leftLift !== null) peakGroundClearance = Math.max(peakGroundClearance, leftLift);
+    if (rightLift !== null) peakGroundClearance = Math.max(peakGroundClearance, rightLift);
+
+    if (signal.timestampMs < baseline.calibrationEndMs) {
+      phase = anyContact ? 'GROUND_CONTACT' : 'UNCERTAIN';
+      if (anyContact) {
+        lastContactMs = signal.timestampMs;
+        lastContactCaptureMs = signal.captureTimestampMs;
+        lastContactLeftToeY = signal.leftToeY;
+        lastContactRightToeY = signal.rightToeY;
+        lastContactLeftGroundY = bestFootGroundY(signal.leftToeY, signal.leftHeelY, signal.leftAnkleY);
+        lastContactRightGroundY = bestFootGroundY(signal.rightToeY, signal.rightHeelY, signal.rightAnkleY);
+      }
+    } else if (!airborne) {
+      if (anyContact) {
+        phase = 'GROUND_CONTACT';
+        lastContactMs = signal.timestampMs;
+        lastContactCaptureMs = signal.captureTimestampMs;
+        lastContactLeftToeY = signal.leftToeY;
+        lastContactRightToeY = signal.rightToeY;
+        lastContactLeftGroundY = bestFootGroundY(signal.leftToeY, signal.leftHeelY, signal.leftAnkleY);
+        lastContactRightGroundY = bestFootGroundY(signal.rightToeY, signal.rightHeelY, signal.rightAnkleY);
+        takeoffConfirm = 0;
+        trackingGap = 0;
+        takeoffCandidateStart = null;
+        takeoffCandidateStartCaptureMs = null;
+      } else if (bothClear) {
+        phase = 'AIRBORNE';
+        trackingGap = 0;
+        takeoffCandidateStart ??= signal.timestampMs;
+        takeoffCandidateStartCaptureMs ??= signal.captureTimestampMs;
+        takeoffConfirm += 1;
+        if (takeoffConfirm >= requiredTakeoffConfirmFrames(sampleFps, leftContact, rightContact)) {
+          takeoffMs = lastContactMs ?? takeoffCandidateStart;
+          takeoffCaptureMs = lastContactCaptureMs ?? takeoffCandidateStartCaptureMs;
+          airborne = true;
+          stablePostLandingFrames = 0;
+        }
+      } else {
+        phase = 'UNCERTAIN';
+        uncertainFrames += 1;
+        trackingGap += 1;
+        if (takeoffConfirm > 0 && trackingGap <= MAX_TAKEOFF_GAP_FRAMES) {
+          phase = 'AIRBORNE';
+        } else {
+          takeoffConfirm = 0;
+          trackingGap = 0;
+          takeoffCandidateStart = null;
+          takeoffCandidateStartCaptureMs = null;
+        }
+      }
+    } else {
+      if (anyContact) {
+        phase = 'GROUND_CONTACT';
+        landingCandidateStart ??= signal.timestampMs;
+        landingCandidateStartCaptureMs ??= signal.captureTimestampMs;
+        landingConfirm += 1;
+        if (
+          landingConfirm >= requiredLandingConfirmFrames(sampleFps, leftContact, rightContact) &&
+          landingMs === null
+        ) {
+          landingMs = landingCandidateStart;
+          landingCaptureMs = landingCandidateStartCaptureMs;
+          airborne = false;
+          stablePostLandingFrames = 1;
+        } else if (landingMs !== null) {
+          stablePostLandingFrames += 1;
+        }
+      } else if (bothClear) {
+        phase = 'AIRBORNE';
+        landingConfirm = 0;
+        landingCandidateStart = null;
+        landingCandidateStartCaptureMs = null;
+      } else {
+        phase = 'UNCERTAIN';
+        uncertainFrames += 1;
+      }
+    }
+
+    phaseTimeline.push({
+      frameIndex: signal.frameIndex,
+      timestampMs: signal.timestampMs,
+      phase,
+      leftLift,
+      rightLift,
+      hipLift,
+      horizontalDrift,
+      leftToeContact: leftContact.contact,
+      rightToeContact: rightContact.contact,
+      leftContactConfidence: leftContact.contact === null ? null : leftContact.confidence,
+      rightContactConfidence: rightContact.contact === null ? null : rightContact.confidence,
+      leftToeY: signal.leftToeY,
+      rightToeY: signal.rightToeY,
+      leftHeelY: signal.leftHeelY,
+      rightHeelY: signal.rightHeelY,
+      leftAnkleY: signal.leftAnkleY,
+      rightAnkleY: signal.rightAnkleY,
+      floorBandY: signal.floorBandY,
+      floorConfidence: signal.floorConfidence,
+      poseConfidence: signal.avgConfidence,
+    });
+
+    if (landingMs !== null && stablePostLandingFrames >= LANDING_CONFIRM_FRAMES + 2) {
+      break;
+    }
+  }
+
+  const analyzedFrames = Math.max(phaseTimeline.length, 1);
+  const uncertaintyRatio = uncertainFrames / analyzedFrames;
+  const averageContactReliability =
+    contactConfidenceValues.length > 0 ? average(contactConfidenceValues) : 0;
+  const fullBodyVisibleRatio = visibleFrames / analyzedFrames;
+  const feetVisibleRatio = feetVisibleFrames / analyzedFrames;
+
+  let invalidReason: JumpInvalidReason | undefined;
+  if (fullBodyVisibleRatio < MIN_FULL_BODY_VISIBLE_RATIO) {
+    invalidReason = 'BODY_NOT_FULLY_VISIBLE';
+  } else if (feetVisibleRatio < MIN_FEET_VISIBLE_RATIO) {
+    invalidReason = 'FEET_NOT_VISIBLE';
+  } else if (maxHorizontalDrift > MAX_ALLOWED_HORIZONTAL_DRIFT) {
+    invalidReason = 'EXCESS_HORIZONTAL_MOTION';
+  } else if (takeoffMs === null) {
+    invalidReason = 'NO_TAKEOFF';
+  } else if (landingMs === null) {
+    invalidReason = 'NO_LANDING';
+  } else if (landingMs <= takeoffMs) {
+    invalidReason = 'EVENT_ORDER_INVALID';
+  } else if (
+    takeoffCaptureMs !== null &&
+    landingCaptureMs !== null &&
+    landingCaptureMs <= takeoffCaptureMs
+  ) {
+    invalidReason = 'EVENT_ORDER_INVALID';
+  } else {
+    const flightMs = (landingCaptureMs ?? landingMs) - (takeoffCaptureMs ?? takeoffMs);
+    if (flightMs < MIN_FLIGHT_MS || flightMs > MAX_FLIGHT_MS) {
+      invalidReason = 'AIRTIME_OUT_OF_RANGE';
+    }
+  }
+
+  const attemptWindowStartMs = Math.max(0, baseline.calibrationStartMs - ATTEMPT_WINDOW_PRE_ROLL_MS);
+  const attemptWindowEndMs = Math.min(
+    last(evaluationSignals)?.timestampMs ?? baseline.calibrationEndMs,
+    (landingMs ?? last(evaluationSignals)?.timestampMs ?? baseline.calibrationEndMs) + ATTEMPT_WINDOW_POST_ROLL_MS,
+  );
+
+  const evaluation: AttemptEvaluation = {
+    baseline,
+    takeoffMs,
+    landingMs,
+    takeoffCaptureMs,
+    landingCaptureMs,
+    phaseTimeline,
+    invalidReason,
+    maxHorizontalDrift,
+    uncertaintyRatio,
+    averageContactReliability,
+    fullBodyVisibleRatio,
+    feetVisibleRatio,
+    peakHipLift,
+    peakGroundClearance,
+    attemptWindowStartMs,
+    attemptWindowEndMs,
+    selectionScore: 0,
+    takeoffLeftToeY: lastContactLeftToeY,
+    takeoffRightToeY: lastContactRightToeY,
+  };
+
+  evaluation.selectionScore = selectionScoreForAttempt(evaluation, averageConfidence);
+  return evaluation;
+}
+
+function selectBestAttemptEvaluation(
+  samples: FrameSignals[],
+  averageConfidence: number,
+  sampleFps: number,
+): {
+  evaluation: AttemptEvaluation | null;
+  candidateCount: number;
+} {
+  const candidates = collectCalibrationCandidates(samples);
+  let bestValid: AttemptEvaluation | null = null;
+  let bestAny: AttemptEvaluation | null = null;
+
+  for (const candidate of candidates) {
+    const evaluation = evaluateAttemptCandidate(samples, candidate, averageConfidence, sampleFps);
+    if (!bestAny || evaluation.selectionScore > bestAny.selectionScore) {
+      bestAny = evaluation;
+    }
+    if (!evaluation.invalidReason && (!bestValid || evaluation.selectionScore > bestValid.selectionScore)) {
+      bestValid = evaluation;
+    }
+  }
+
+  return {
+    evaluation: bestValid ?? bestAny,
+    candidateCount: candidates.length,
+  };
+}
+
+function buildDebugFromAttempt(
+  attempt: AttemptEvaluation,
+  analyzedFrameCount: number,
+  videoDurationMs: number,
+  videoFps: number,
+  sampleFps: number,
+  playbackVideoFps: number | undefined,
+  playbackSampleFps: number | undefined,
+  playbackDurationMs: number | undefined,
+  captureDurationMs: number | undefined,
+  timingMode: JumpTimingMode | undefined,
+  timingConfidence: number | undefined,
+  captureTimeScale: number | undefined,
+  hasTimeSegments: boolean | undefined,
+  usedOriginalAsset: boolean | undefined,
+  usedPlaybackAsset: boolean | undefined,
+  originalDurationMs: number | null | undefined,
+  timebaseSource: string | undefined,
+  averageConfidence: number,
+): JumpAnalysisDebug {
+  const baseline: JumpBaselineDebug = {
+    leftToeY: attempt.baseline.leftToeY,
+    rightToeY: attempt.baseline.rightToeY,
+    takeoffLeftToeY: attempt.takeoffLeftToeY ?? undefined,
+    takeoffRightToeY: attempt.takeoffRightToeY ?? undefined,
+    leftAnkleY: attempt.baseline.leftAnkleY,
+    rightAnkleY: attempt.baseline.rightAnkleY,
+    hipY: attempt.baseline.hipY,
+    torso: attempt.baseline.torso,
+    centerX: attempt.baseline.centerX,
+  };
+
+  return {
+    calibrationStartMs: attempt.baseline.calibrationStartMs,
+    calibrationEndMs: attempt.baseline.calibrationEndMs,
+    attemptWindowStartMs: attempt.attemptWindowStartMs,
+    attemptWindowEndMs: attempt.attemptWindowEndMs,
+    baseline,
+    analyzedFrameCount,
+    videoDurationMs,
+    videoFps,
+    sampleFps,
+    playbackVideoFps,
+    playbackSampleFps,
+    playbackDurationMs,
+    captureDurationMs,
+    slowMotionScaleFactor:
+      playbackVideoFps && videoFps > 0 ? playbackVideoFps / videoFps : undefined,
+    timingMode,
+    timingConfidence,
+    timingTrusted: isTrustedTimingMode(timingMode),
+    captureTimeScale,
+    hasTimeSegments,
+    usedOriginalAsset,
+    usedPlaybackAsset,
+    originalDurationMs,
+    timebaseSource,
+    averageConfidence,
+    uncertaintyRatio: attempt.uncertaintyRatio,
+    fullBodyVisibleRatio: attempt.fullBodyVisibleRatio,
+    feetVisibleRatio: attempt.feetVisibleRatio,
+    maxHorizontalDrift: attempt.maxHorizontalDrift,
+    calibrationStability: attempt.baseline.stability,
+    averageContactReliability: attempt.averageContactReliability,
+    attemptSelectionScore: attempt.selectionScore,
+  };
+}
+
 export function explainJumpAnalysis(result: JumpAnalysisResult): string {
   return result.summary;
+}
+
+export function suggestJumpAttemptWindow(
+  frames: JumpLandmarkFrame[],
+  options: AnalysisOptions = {},
+): JumpAttemptWindowSuggestion | null {
+  if (frames.length === 0) return null;
+
+  const minConfidence = options.minConfidence ?? MIN_CONFIDENCE;
+  const rawSignals = frames.map((frame) => toSignals(frame, minConfidence));
+  const signals = applyEma(applyMedianFilter(rawSignals));
+  const averageConfidence = average(signals.map((signal) => signal.avgConfidence));
+  const selection = selectBestAttemptEvaluation(signals, averageConfidence, options.sampleFps ?? options.videoFps ?? 60);
+  const attempt = selection.evaluation;
+  if (!attempt || attempt.takeoffMs === null || attempt.landingMs === null) {
+    return null;
+  }
+
+  return {
+    startMs: attempt.attemptWindowStartMs,
+    endMs: attempt.attemptWindowEndMs,
+    calibrationStartMs: attempt.baseline.calibrationStartMs,
+    calibrationEndMs: attempt.baseline.calibrationEndMs,
+    takeoffMs: attempt.takeoffMs,
+    landingMs: attempt.landingMs,
+    selectionScore: attempt.selectionScore,
+  };
 }
 
 export function analyzeJumpLandmarks(
@@ -599,6 +1312,8 @@ export function analyzeJumpLandmarks(
   const videoDurationMs =
     options.videoDurationMs ??
     Math.max(0, ...frames.map((frame) => frame.timestampMs), 0);
+  const playbackDurationMs = options.playbackDurationMs ?? videoDurationMs;
+  const captureDurationMs = options.captureDurationMs ?? videoDurationMs;
   const videoFps = options.videoFps ?? options.sampleFps ?? 60;
   const sampleFps = options.sampleFps ?? options.videoFps ?? 60;
   const debugBase = emptyDebug(
@@ -608,6 +1323,16 @@ export function analyzeJumpLandmarks(
     sampleFps,
     options.playbackVideoFps,
     options.playbackSampleFps,
+    playbackDurationMs,
+    options.captureDurationMs ?? captureDurationMs,
+    options.timingMode,
+    options.timingConfidence,
+    options.captureTimeScale,
+    options.hasTimeSegments,
+    options.usedOriginalAsset,
+    options.usedPlaybackAsset,
+    options.originalDurationMs,
+    options.timebaseSource,
   );
 
   if (frames.length === 0) {
@@ -618,9 +1343,9 @@ export function analyzeJumpLandmarks(
   const rawSignals = frames.map((frame) => toSignals(frame, minConfidence));
   const signals = applyEma(applyMedianFilter(rawSignals));
   const averageConfidence = average(signals.map((signal) => signal.avgConfidence));
-  const fullBodyVisibleRatio =
+  const globalFullBodyVisibleRatio =
     signals.filter((signal) => signal.fullBodyVisible).length / signals.length;
-  const feetVisibleRatio =
+  const globalFeetVisibleRatio =
     signals.filter((signal) => signal.feetVisible).length / signals.length;
   const observedPersonCount =
     options.personCountSummary ??
@@ -638,8 +1363,8 @@ export function analyzeJumpLandmarks(
       {
         ...debugBase,
         averageConfidence,
-        fullBodyVisibleRatio,
-        feetVisibleRatio,
+        fullBodyVisibleRatio: globalFullBodyVisibleRatio,
+        feetVisibleRatio: globalFeetVisibleRatio,
       },
       [],
       'LOW',
@@ -648,280 +1373,142 @@ export function analyzeJumpLandmarks(
     );
   }
 
-  if (fullBodyVisibleRatio < MIN_FULL_BODY_VISIBLE_RATIO) {
+  const selection = selectBestAttemptEvaluation(
+    signals,
+    averageConfidence,
+    options.sampleFps ?? options.videoFps ?? 60,
+  );
+  if (!selection.evaluation) {
+    const fallbackReason =
+      globalFullBodyVisibleRatio < MIN_FULL_BODY_VISIBLE_RATIO
+        ? 'BODY_NOT_FULLY_VISIBLE'
+        : globalFeetVisibleRatio < MIN_FEET_VISIBLE_RATIO
+          ? 'FEET_NOT_VISIBLE'
+          : 'NO_STABLE_CALIBRATION';
+
     return buildResult(
       {
         ...debugBase,
         averageConfidence,
-        fullBodyVisibleRatio,
-        feetVisibleRatio,
+        fullBodyVisibleRatio: globalFullBodyVisibleRatio,
+        feetVisibleRatio: globalFeetVisibleRatio,
       },
       [],
       'LOW',
-      ['INSUFFICIENT_FULL_BODY_VISIBILITY'],
-      'BODY_NOT_FULLY_VISIBLE',
+      [
+        fallbackReason === 'BODY_NOT_FULLY_VISIBLE'
+          ? 'INSUFFICIENT_FULL_BODY_VISIBILITY'
+          : fallbackReason === 'FEET_NOT_VISIBLE'
+            ? 'INSUFFICIENT_FEET_VISIBILITY'
+            : 'UNSTABLE_CALIBRATION',
+      ],
+      fallbackReason,
     );
   }
 
-  if (feetVisibleRatio < 0.45) {
-    return buildResult(
-      {
-        ...debugBase,
-        averageConfidence,
-        fullBodyVisibleRatio,
-        feetVisibleRatio,
-      },
-      [],
-      'LOW',
-      ['INSUFFICIENT_FEET_VISIBILITY'],
-      'FEET_NOT_VISIBLE',
-    );
+  const attempt = selection.evaluation;
+  if (attempt.fullBodyVisibleRatio < 0.8) {
+    preFlags.push('PARTIAL_FULL_BODY_VISIBILITY');
   }
 
-  const baseline = buildBaseline(signals);
-  if (!baseline) {
-    return buildResult(
-      {
-        ...debugBase,
-        averageConfidence,
-        fullBodyVisibleRatio,
-        feetVisibleRatio,
-      },
-      [],
-      'LOW',
-      ['UNSTABLE_CALIBRATION'],
-      'NO_STABLE_CALIBRATION',
-    );
-  }
-
-  let takeoffCandidateStart: number | null = null;
-  let takeoffCandidateStartCaptureMs: number | null = null;
-  let landingCandidateStart: number | null = null;
-  let landingCandidateStartCaptureMs: number | null = null;
-  let takeoffConfirm = 0;
-  let landingConfirm = 0;
-  let takeoffMs: number | null = null;
-  let landingMs: number | null = null;
-  let takeoffCaptureMs: number | null = null;
-  let landingCaptureMs: number | null = null;
-  let lastGroundContactMs: number | null = null;
-  let lastGroundContactCaptureMs: number | null = null;
-  let takeoffCandidateLastContactMs: number | null = null;
-  let takeoffCandidateLastContactCaptureMs: number | null = null;
-  let airborne = false;
-  let uncertainFrames = 0;
-  let trackingGap = 0;
-  let maxHorizontalDrift = 0;
-
-  const phaseTimeline: JumpPhaseSample[] = [];
-  const torsoScale = Math.max(0.08, baseline.torso);
-
-  for (const signal of signals) {
-    const horizontalDrift =
-      signal.centerX === null ? null : Math.abs(signal.centerX - baseline.centerX);
-    if (horizontalDrift !== null) {
-      maxHorizontalDrift = Math.max(maxHorizontalDrift, horizontalDrift);
-    }
-
-    const leftFootY = bestFootGroundY(signal.leftToeY, signal.leftHeelY, signal.leftAnkleY);
-    const rightFootY = bestFootGroundY(signal.rightToeY, signal.rightHeelY, signal.rightAnkleY);
-    const leftFootBaseline = baseline.leftGroundY;
-    const rightFootBaseline = baseline.rightGroundY;
-
-    const leftLift =
-      leftFootY === null ? null : (leftFootBaseline - leftFootY) / torsoScale;
-    const rightLift =
-      rightFootY === null ? null : (rightFootBaseline - rightFootY) / torsoScale;
-    const hipLift =
-      signal.hipY === null ? null : (baseline.hipY - signal.hipY) / torsoScale;
-
-    let phase: JumpContactPhase = 'UNCERTAIN';
-    const bothAirborne =
-      leftLift !== null &&
-      rightLift !== null &&
-      leftLift > TAKEOFF_THRESHOLD &&
-      rightLift > TAKEOFF_THRESHOLD;
-    const oneFootGrounded =
-      (leftLift !== null && leftLift <= LANDING_THRESHOLD) ||
-      (rightLift !== null && rightLift <= LANDING_THRESHOLD);
-
-    if (!signal.feetVisible) {
-      uncertainFrames += 1;
-      trackingGap += 1;
-      if (!airborne) {
-        if (takeoffConfirm > 0 && trackingGap <= MAX_TAKEOFF_GAP_FRAMES) {
-          takeoffConfirm += 1;
-          if (takeoffConfirm >= TAKEOFF_CONFIRM_FRAMES) {
-            takeoffMs = takeoffCandidateLastContactMs ?? takeoffCandidateStart;
-            takeoffCaptureMs =
-              takeoffCandidateLastContactCaptureMs ?? takeoffCandidateStartCaptureMs;
-            airborne = true;
-          }
-        } else if (trackingGap > MAX_TAKEOFF_GAP_FRAMES) {
-          takeoffConfirm = 0;
-          takeoffCandidateStart = null;
-          takeoffCandidateStartCaptureMs = null;
-          takeoffCandidateLastContactMs = null;
-          takeoffCandidateLastContactCaptureMs = null;
-        }
-      }
-      landingConfirm = 0;
-      landingCandidateStart = null;
-      landingCandidateStartCaptureMs = null;
-      phase = 'UNCERTAIN';
-    } else {
-      trackingGap = 0;
-      if (!airborne) {
-        phase = bothAirborne ? 'AIRBORNE' : oneFootGrounded ? 'GROUND_CONTACT' : 'UNCERTAIN';
-        if (signal.timestampMs >= baseline.calibrationEndMs && bothAirborne) {
-          takeoffCandidateStart ??= signal.timestampMs;
-          takeoffCandidateStartCaptureMs ??= signal.captureTimestampMs;
-          takeoffCandidateLastContactMs ??= lastGroundContactMs ?? signal.timestampMs;
-          takeoffCandidateLastContactCaptureMs ??=
-            lastGroundContactCaptureMs ?? signal.captureTimestampMs;
-          takeoffConfirm += 1;
-          if (takeoffConfirm >= TAKEOFF_CONFIRM_FRAMES) {
-            takeoffMs = takeoffCandidateLastContactMs ?? takeoffCandidateStart;
-            takeoffCaptureMs =
-              takeoffCandidateLastContactCaptureMs ?? takeoffCandidateStartCaptureMs;
-            airborne = true;
-          }
-        } else if (phase === 'GROUND_CONTACT') {
-          lastGroundContactMs = signal.timestampMs;
-          lastGroundContactCaptureMs = signal.captureTimestampMs;
-          takeoffConfirm = 0;
-          takeoffCandidateStart = null;
-          takeoffCandidateStartCaptureMs = null;
-          takeoffCandidateLastContactMs = null;
-          takeoffCandidateLastContactCaptureMs = null;
-        } else {
-          uncertainFrames += 1;
-          takeoffConfirm = 0;
-          takeoffCandidateStart = null;
-          takeoffCandidateStartCaptureMs = null;
-          takeoffCandidateLastContactMs = null;
-          takeoffCandidateLastContactCaptureMs = null;
-        }
-      } else {
-        if (oneFootGrounded) {
-          phase = 'GROUND_CONTACT';
-          landingCandidateStart ??= signal.timestampMs;
-          landingCandidateStartCaptureMs ??= signal.captureTimestampMs;
-          landingConfirm += 1;
-          if (landingConfirm >= LANDING_CONFIRM_FRAMES && landingMs === null) {
-            landingMs = landingCandidateStart;
-            landingCaptureMs = landingCandidateStartCaptureMs;
-            airborne = false;
-          }
-        } else {
-          phase = bothAirborne ? 'AIRBORNE' : 'UNCERTAIN';
-          if (phase === 'UNCERTAIN') {
-            uncertainFrames += 1;
-          }
-          landingConfirm = 0;
-          landingCandidateStart = null;
-          landingCandidateStartCaptureMs = null;
-        }
-      }
-    }
-
-    phaseTimeline.push({
-      frameIndex: signal.frameIndex,
-      timestampMs: signal.timestampMs,
-      phase,
-      leftLift,
-      rightLift,
-      hipLift,
-      horizontalDrift,
-    });
-  }
-
-  const uncertaintyRatio = phaseTimeline.length > 0 ? uncertainFrames / phaseTimeline.length : 1;
+  const visibilityRatio = Math.min(attempt.fullBodyVisibleRatio, attempt.feetVisibleRatio);
   const qualityFlags = [...preFlags];
-  const visibilityRatio = Math.min(fullBodyVisibleRatio, feetVisibleRatio);
-  if (fullBodyVisibleRatio < 0.8) {
-    qualityFlags.push('PARTIAL_FULL_BODY_VISIBILITY');
-  }
   const quality = scoreQuality(
     averageConfidence,
-    uncertaintyRatio,
+    attempt.uncertaintyRatio,
     visibilityRatio,
     fpsScore,
-    baseline.stability,
+    attempt.baseline.stability,
+    attempt.averageContactReliability,
     qualityFlags,
   );
 
-  const debug: JumpAnalysisDebug = {
-    calibrationEndMs: baseline.calibrationEndMs,
-    baseline,
-    analyzedFrameCount: frames.length,
+  const debug = buildDebugFromAttempt(
+    attempt,
+    frames.length,
     videoDurationMs,
     videoFps,
     sampleFps,
-    playbackVideoFps: options.playbackVideoFps,
-    playbackSampleFps: options.playbackSampleFps,
-    slowMotionScaleFactor:
-      options.playbackVideoFps && videoFps > 0
-        ? options.playbackVideoFps / videoFps
-        : undefined,
+    options.playbackVideoFps,
+    options.playbackSampleFps,
+    playbackDurationMs,
+    options.captureDurationMs ?? captureDurationMs,
+    options.timingMode,
+    options.timingConfidence,
+    options.captureTimeScale,
+    options.hasTimeSegments,
+    options.usedOriginalAsset,
+    options.usedPlaybackAsset,
+    options.originalDurationMs,
+    options.timebaseSource,
     averageConfidence,
-    uncertaintyRatio,
-    fullBodyVisibleRatio,
-    feetVisibleRatio,
-    maxHorizontalDrift,
-    calibrationStability: baseline.stability,
-  };
+  );
 
-  if (maxHorizontalDrift > MAX_ALLOWED_HORIZONTAL_DRIFT) {
+  if (!isTrustedTimingMode(options.timingMode)) {
     return buildResult(
       debug,
-      phaseTimeline,
+      attempt.phaseTimeline,
       'LOW',
-      [...qualityFlags, 'EXCESS_HORIZONTAL_MOTION'],
-      'EXCESS_HORIZONTAL_MOTION',
+      [...qualityFlags, 'TIMING_AMBIGUOUS'],
+      'TIMING_AMBIGUOUS',
+      attempt.takeoffMs,
+      attempt.landingMs,
+      null,
+      null,
+      null,
+      null,
     );
   }
 
-  if (takeoffMs === null) {
-    return buildResult(debug, phaseTimeline, quality, qualityFlags, 'NO_TAKEOFF');
+  if (attempt.invalidReason) {
+    const invalidFlightMs =
+      attempt.invalidReason === 'EVENT_ORDER_INVALID'
+        ? null
+        : attempt.takeoffCaptureMs !== null && attempt.landingCaptureMs !== null
+          ? attempt.landingCaptureMs - attempt.takeoffCaptureMs
+          : null;
+    return buildResult(
+      debug,
+      attempt.phaseTimeline,
+      attempt.invalidReason === 'EXCESS_HORIZONTAL_MOTION' ||
+        attempt.invalidReason === 'AIRTIME_OUT_OF_RANGE' ||
+        attempt.invalidReason === 'EVENT_ORDER_INVALID'
+        ? 'LOW'
+        : quality,
+      attempt.invalidReason === 'EXCESS_HORIZONTAL_MOTION'
+        ? [...qualityFlags, 'EXCESS_HORIZONTAL_MOTION']
+        : attempt.invalidReason === 'AIRTIME_OUT_OF_RANGE'
+          ? [...qualityFlags, 'AIRTIME_OUT_OF_RANGE']
+          : attempt.invalidReason === 'EVENT_ORDER_INVALID'
+            ? [...qualityFlags, 'EVENT_ORDER_INVALID']
+          : qualityFlags,
+      attempt.invalidReason,
+      attempt.takeoffMs,
+      attempt.landingMs,
+      attempt.invalidReason === 'EVENT_ORDER_INVALID' ? null : attempt.takeoffCaptureMs,
+      attempt.invalidReason === 'EVENT_ORDER_INVALID' ? null : attempt.landingCaptureMs,
+      invalidFlightMs,
+    );
   }
 
-  if (landingMs === null) {
-    return buildResult(debug, phaseTimeline, quality, qualityFlags, 'NO_LANDING', takeoffMs);
-  }
-
-  const physicalTakeoffMs = takeoffCaptureMs ?? takeoffMs;
-  const physicalLandingMs = landingCaptureMs ?? landingMs;
+  const physicalTakeoffMs = (attempt.takeoffCaptureMs ?? attempt.takeoffMs)!;
+  const physicalLandingMs = (attempt.landingCaptureMs ?? attempt.landingMs)!;
   const flightMs = physicalLandingMs - physicalTakeoffMs;
-  if (flightMs < MIN_FLIGHT_MS || flightMs > MAX_FLIGHT_MS) {
-    return buildResult(
-      debug,
-      phaseTimeline,
-      'LOW',
-      [...qualityFlags, 'AIRTIME_OUT_OF_RANGE'],
-      'AIRTIME_OUT_OF_RANGE',
-      takeoffMs,
-      landingMs,
-      physicalTakeoffMs,
-      physicalLandingMs,
-      flightMs,
-    );
-  }
-
   const heightCm = heightFromFlightTime(flightMs);
+
   return buildResult(
     debug,
-    phaseTimeline,
+    attempt.phaseTimeline,
     quality,
     qualityFlags,
     undefined,
-    takeoffMs,
-    landingMs,
+    attempt.takeoffMs,
+    attempt.landingMs,
     physicalTakeoffMs,
     physicalLandingMs,
     flightMs,
     heightCm,
-    `Flight time ${flightMs.toFixed(1)} ms produced ${heightCm.toFixed(1)} cm.`,
+    `Detected last toe contact at ${attempt.takeoffMs?.toFixed(1)} ms playback and first return-to-ground contact at ${attempt.landingMs?.toFixed(1)} ms playback.`,
   );
 }
 

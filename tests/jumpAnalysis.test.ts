@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { analyzeJumpLandmarks } from '../utils/jumpAnalysis.ts';
+import {
+  analyzeJumpLandmarks,
+  resolveAdaptiveConfirmFrames,
+  suggestJumpAttemptWindow,
+} from '../utils/jumpAnalysis.ts';
 import { heightFromFlightTime, type JumpKeypoint, type JumpLandmarkFrame } from '../utils/jumpCalc.ts';
 import { KP } from '../utils/poseUtils.ts';
 
@@ -143,6 +147,56 @@ function makeDelayedCalibrationFrames(): JumpLandmarkFrame[] {
   return [...movingPrefix, ...shifted];
 }
 
+function makeToeContactPriorityFrames(): JumpLandmarkFrame[] {
+  const timestamps = [
+    0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400,
+  ];
+
+  const sequence = [
+    { leftToeY: 0.905, rightToeY: 0.905, leftHeelY: 0.895, rightHeelY: 0.895 },
+    { leftToeY: 0.905, rightToeY: 0.904, leftHeelY: 0.895, rightHeelY: 0.894 },
+    { leftToeY: 0.905, rightToeY: 0.905, leftHeelY: 0.894, rightHeelY: 0.895 },
+    { leftToeY: 0.904, rightToeY: 0.905, leftHeelY: 0.894, rightHeelY: 0.895 },
+    { leftToeY: 0.905, rightToeY: 0.906, leftHeelY: 0.895, rightHeelY: 0.896 },
+    { leftToeY: 0.905, rightToeY: 0.905, leftHeelY: 0.895, rightHeelY: 0.895 },
+    { leftToeY: 0.904, rightToeY: 0.905, leftHeelY: 0.894, rightHeelY: 0.895 },
+    { leftToeY: 0.905, rightToeY: 0.905, leftHeelY: 0.895, rightHeelY: 0.895 },
+    { leftToeY: 0.905, rightToeY: 0.904, leftHeelY: 0.872, rightHeelY: 0.871, leftAnkleY: 0.84, rightAnkleY: 0.84 },
+    { leftToeY: 0.856, rightToeY: 0.855, leftHeelY: 0.842, rightHeelY: 0.841, leftAnkleY: 0.812, rightAnkleY: 0.812 },
+    { leftToeY: 0.834, rightToeY: 0.833, leftHeelY: 0.82, rightHeelY: 0.819, leftAnkleY: 0.79, rightAnkleY: 0.79 },
+    { leftToeY: 0.846, rightToeY: 0.845, leftHeelY: 0.832, rightHeelY: 0.831, leftAnkleY: 0.802, rightAnkleY: 0.802 },
+    { leftToeY: 0.905, rightToeY: 0.905, leftHeelY: 0.894, rightHeelY: 0.894, leftAnkleY: 0.865, rightAnkleY: 0.865 },
+    { leftToeY: 0.905, rightToeY: 0.905, leftHeelY: 0.895, rightHeelY: 0.895 },
+    { leftToeY: 0.905, rightToeY: 0.904, leftHeelY: 0.895, rightHeelY: 0.894 },
+  ];
+
+  return timestamps.map((timestamp, index) => makeFrame(index, timestamp, sequence[index]));
+}
+
+function makeLongClipWithOneJump(): JumpLandmarkFrame[] {
+  const prefix = Array.from({ length: 25 }, (_, index) =>
+    makeFrame(index, index * 200, {
+      faceVisible: false,
+      centerX: 0.2 + (index % 5) * 0.08,
+    }),
+  );
+
+  const shiftedJump = makeValidFlightFrames().map((frame, index) => ({
+    ...frame,
+    frameIndex: prefix.length + index,
+    timestampMs: frame.timestampMs + 5000,
+  }));
+
+  const suffixStart = shiftedJump[shiftedJump.length - 1].timestampMs + 200;
+  const suffix = Array.from({ length: 15 }, (_, index) =>
+    makeFrame(prefix.length + shiftedJump.length + index, suffixStart + index * 200, {
+      centerX: 0.5 + (index % 4) * 0.05,
+    }),
+  );
+
+  return [...prefix, ...shiftedJump, ...suffix];
+}
+
 test('heightFromFlightTime converts airtime to centimeters', () => {
   assert.ok(Math.abs(heightFromFlightTime(500) - 30.65625) < 0.001);
 });
@@ -207,6 +261,85 @@ test('calibration can be found later in a long clip before the jump', () => {
   assert.equal(result.takeoffMs, 1500);
   assert.equal(result.landingMs, 2100);
   assert.equal(result.debug.calibrationEndMs, 1500);
+});
+
+test('takeoff is anchored to the last toe-contact frame before the clear sequence', () => {
+  const result = analyzeJumpLandmarks(makeToeContactPriorityFrames(), {
+    videoDurationMs: 1500,
+    sampleFps: 240,
+    videoFps: 240,
+  });
+
+  assert.equal(result.invalidReason, undefined);
+  assert.equal(result.takeoffMs, 800);
+  assert.equal(result.landingMs, 1200);
+  assert.equal(result.flightMs, 400);
+});
+
+test('attempt window suggestion isolates the single jump inside a long clip', () => {
+  const frames = makeLongClipWithOneJump();
+  const suggestion = suggestJumpAttemptWindow(frames, {
+    videoDurationMs: 9000,
+    sampleFps: 30,
+    videoFps: 30,
+  });
+
+  assert.ok(suggestion);
+  assert.equal(suggestion?.takeoffMs, 5700);
+  assert.equal(suggestion?.landingMs, 6300);
+  assert.ok((suggestion?.startMs ?? 0) < 5700);
+  assert.ok((suggestion?.endMs ?? 0) > 6300);
+});
+
+test('adaptive confirmation uses one frame only for high-fps strong signals', () => {
+  assert.equal(resolveAdaptiveConfirmFrames(240, 0.8, 0.7, 2), 1);
+  assert.equal(resolveAdaptiveConfirmFrames(240, 0.6, 0.7, 2), 2);
+  assert.equal(resolveAdaptiveConfirmFrames(60, 0.9, 0.7, 2), 2);
+});
+
+test('timing ambiguous suppresses physical height even when playback events are found', () => {
+  const result = analyzeJumpLandmarks(makeValidFlightFrames(), {
+    videoDurationMs: 1600,
+    playbackDurationMs: 1600,
+    captureDurationMs: 1600,
+    sampleFps: 240,
+    videoFps: 240,
+    timingMode: 'timing_ambiguous',
+    timingConfidence: 0.2,
+    timebaseSource: 'photos_segments_mismatch',
+  });
+
+  assert.equal(result.invalidReason, 'TIMING_AMBIGUOUS');
+  assert.equal(result.takeoffMs, 700);
+  assert.equal(result.landingMs, 1300);
+  assert.equal(result.flightMs, null);
+  assert.equal(result.heightCm, null);
+});
+
+test('event order invalid is rejected instead of surfacing negative flight time', () => {
+  const frames = makeValidFlightFrames().map((frame) => ({
+    ...frame,
+    captureTimestampMs: 1600 - frame.timestampMs,
+  }));
+
+  const result = analyzeJumpLandmarks(frames, {
+    videoDurationMs: 1600,
+    playbackDurationMs: 1600,
+    captureDurationMs: 1600,
+    sampleFps: 240,
+    videoFps: 240,
+    timingMode: 'playback_is_physical',
+    timingConfidence: 0.98,
+    timebaseSource: 'playback_asset_flat_hfr',
+  });
+
+  assert.equal(result.invalidReason, 'EVENT_ORDER_INVALID');
+  assert.equal(result.takeoffMs, 700);
+  assert.equal(result.landingMs, 1300);
+  assert.equal(result.takeoffPhysicalMs, null);
+  assert.equal(result.landingPhysicalMs, null);
+  assert.equal(result.flightMs, null);
+  assert.equal(result.heightCm, null);
 });
 
 test('missing face or upper body is rejected before event detection', () => {

@@ -19,7 +19,15 @@ export type JumpInvalidReason =
   | 'NO_TAKEOFF'
   | 'NO_LANDING'
   | 'AIRTIME_OUT_OF_RANGE'
-  | 'EXCESS_HORIZONTAL_MOTION';
+  | 'EXCESS_HORIZONTAL_MOTION'
+  | 'TIMING_AMBIGUOUS'
+  | 'EVENT_ORDER_INVALID';
+
+export type JumpTimingMode =
+  | 'playback_is_physical'
+  | 'segment_mapped_slow_motion'
+  | 'global_scaled_slow_motion'
+  | 'timing_ambiguous';
 
 export type JumpContactPhase = 'GROUND_CONTACT' | 'AIRBORNE' | 'UNCERTAIN';
 
@@ -55,6 +63,22 @@ export interface JumpLandmarkFrame {
   keypoints: JumpKeypoint[];
   avgConfidence: number;
   personCount?: number;
+  /** Normalised Y of the detected floor band (pixel-based). */
+  floorBandY?: number | null;
+  /** Confidence of the pixel-based floor detection [0,1]. */
+  floorConfidence?: number;
+  /** Bounding box of the left foot in normalised display coords. */
+  leftFootBox?: JumpFootBox | null;
+  /** Bounding box of the right foot in normalised display coords. */
+  rightFootBox?: JumpFootBox | null;
+  /** Visual bottom Y of the left foot from pixel analysis. */
+  leftFootBottomY?: number | null;
+  /** Visual bottom Y of the right foot from pixel analysis. */
+  rightFootBottomY?: number | null;
+  /** Pixel-based contact score for the left foot [0,1]. */
+  leftContactScore?: number | null;
+  /** Pixel-based contact score for the right foot [0,1]. */
+  rightContactScore?: number | null;
 }
 
 export interface JumpFootBox {
@@ -99,6 +123,16 @@ export interface JumpVideoNativeResult {
   playbackVideoFps?: number;
   playbackSampleFps?: number;
   videoDurationMs: number;
+  playbackDurationMs?: number;
+  captureDurationMs?: number;
+  timingMode?: JumpTimingMode;
+  timingConfidence?: number;
+  captureTimeScale?: number;
+  hasTimeSegments?: boolean;
+  usedOriginalAsset?: boolean;
+  usedPlaybackAsset?: boolean;
+  originalDurationMs?: number | null;
+  timebaseSource?: string;
   personCountSummary: JumpPersonCountSummary;
 }
 
@@ -118,11 +152,37 @@ export interface JumpPhaseSample {
   rightLift: number | null;
   hipLift: number | null;
   horizontalDrift: number | null;
+  leftToeContact: boolean | null;
+  rightToeContact: boolean | null;
+  leftContactConfidence: number | null;
+  rightContactConfidence: number | null;
+  /** Raw left toe Y from landmarks (normalised display coords). */
+  leftToeY: number | null;
+  /** Raw right toe Y from landmarks (normalised display coords). */
+  rightToeY: number | null;
+  /** Raw left heel Y from landmarks. */
+  leftHeelY: number | null;
+  /** Raw right heel Y from landmarks. */
+  rightHeelY: number | null;
+  /** Raw left ankle Y from landmarks. */
+  leftAnkleY: number | null;
+  /** Raw right ankle Y from landmarks. */
+  rightAnkleY: number | null;
+  /** Pixel-detected floor band Y for this frame. */
+  floorBandY: number | null;
+  /** Confidence of the floor band detection [0,1]. */
+  floorConfidence: number;
+  /** Average ML Kit pose confidence for this frame. */
+  poseConfidence: number;
 }
 
 export interface JumpBaselineDebug {
   leftToeY: number;
   rightToeY: number;
+  /** Toe Y of the last contact frame before takeoff (adaptive landing baseline). */
+  takeoffLeftToeY?: number;
+  /** Toe Y of the last contact frame before takeoff (adaptive landing baseline). */
+  takeoffRightToeY?: number;
   leftAnkleY: number;
   rightAnkleY: number;
   hipY: number;
@@ -131,7 +191,10 @@ export interface JumpBaselineDebug {
 }
 
 export interface JumpAnalysisDebug {
+  calibrationStartMs?: number;
   calibrationEndMs: number;
+  attemptWindowStartMs?: number;
+  attemptWindowEndMs?: number;
   baseline: JumpBaselineDebug;
   analyzedFrameCount: number;
   videoDurationMs: number;
@@ -139,13 +202,26 @@ export interface JumpAnalysisDebug {
   sampleFps: number;
   playbackVideoFps?: number;
   playbackSampleFps?: number;
+  playbackDurationMs?: number;
+  captureDurationMs?: number;
   slowMotionScaleFactor?: number;
+  timingMode?: JumpTimingMode;
+  timingConfidence?: number;
+  timingTrusted?: boolean;
+  captureTimeScale?: number;
+  hasTimeSegments?: boolean;
+  usedOriginalAsset?: boolean;
+  usedPlaybackAsset?: boolean;
+  originalDurationMs?: number | null;
+  timebaseSource?: string;
   averageConfidence: number;
   uncertaintyRatio: number;
   fullBodyVisibleRatio: number;
   feetVisibleRatio: number;
   maxHorizontalDrift: number;
   calibrationStability: number;
+  averageContactReliability?: number;
+  attemptSelectionScore?: number;
 }
 
 export interface JumpAnalysisResult {
